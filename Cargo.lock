@@ -1588,6 +1588,9 @@ name = "lms-spotty"
 version = "4.62.3"
 dependencies = [
  "clap",
+ "rand 0.8.8",
+ "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "spotty-api",
@@ -1604,6 +1607,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
  "wiremock",
 ]
 
@@ -2886,36 +2890,43 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
 name = "spotty-integrations"
 version = "4.62.3"
 dependencies = [
+ "reqwest",
  "serde",
  "serde_json",
  "spotty-api",
  "spotty-cache",
  "spotty-opml",
  "spotty-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
 name = "spotty-opml"
 version = "4.62.3"
 dependencies = [
+ "reqwest",
  "serde",
  "serde_json",
  "spotty-api",
  "spotty-cache",
  "spotty-playlist-folders",
  "spotty-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -2945,6 +2956,7 @@ dependencies = [
 name = "spotty-web"
 version = "4.62.3"
 dependencies = [
+ "base64 0.22.1",
  "reqwest",
  "serde",
  "serde_json",
@@ -2954,10 +2966,12 @@ dependencies = [
  "spotty-opml",
  "spotty-playlist-folders",
  "spotty-types",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "url",
+ "wiremock",
 ]
 
 [[package]]
