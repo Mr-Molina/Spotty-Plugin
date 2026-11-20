@@ -2840,6 +2840,7 @@ version = "4.62.3"
 dependencies = [
  "bytes",
  "clap",
+ "futures-util",
  "librespot-connect",
  "librespot-core",
  "librespot-discovery",

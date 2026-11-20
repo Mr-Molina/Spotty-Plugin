@@ -10,6 +10,7 @@ workspace = true
 [dependencies]
 bytes = { workspace = true }
 clap = { workspace = true }
+futures-util = { workspace = true }
 librespot-connect = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
 librespot-discovery = { version = "0.8", default-features = false, features = ["with-libmdns", "rustls-tls-webpki-roots"] }
