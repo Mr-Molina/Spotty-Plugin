@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/spotty-types",
+    "crates/spotty-cache",
+    "crates/spotty-api",
+    "crates/spotty-audio",
+    "crates/spotty-playlist-folders",
+    "crates/spotty-opml",
+    "crates/spotty-importer",
+    "crates/spotty-integrations",
+    "crates/spotty-web",
+    "crates/lms-spotty",
+]
+
+[workspace.package]
+version = "4.62.3"
+edition = "2021"
+license = "GPL-2.0-or-later"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+redb = "2"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.8"
+sha2 = "0.10"
+md-5 = "0.10"
+base64 = "0.22"
+url = "2"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bytes = "1"
+futures-util = "0.3"
+tempfile = "3"
+wiremock = "0.6"
+proptest = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+static_mut_refs = "deny"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+borrowed_box = "deny"
+ptr_arg = "deny"
+should_implement_trait = "deny"
+new_without_default = "warn"
+wrong_self_convention = "deny"
+len_without_is_empty = "deny"
+exhaustive_enums = "warn"
+exhaustive_structs = "warn"
+wildcard_imports = "deny"
+ref_option = "warn"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "warn"
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+needless_for_each = "warn"
+must_use_candidate = "warn"
+doc_markdown = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+missing_safety_doc = "deny"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,23 @@
+[package]
+name = "spotty-importer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+md-5 = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spotty-api = { path = "../spotty-api" }
+spotty-cache = { path = "../spotty-cache" }
+spotty-types = { path = "../spotty-types" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

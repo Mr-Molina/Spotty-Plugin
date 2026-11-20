@@ -1,0 +1,30 @@
+[package]
+name = "lms-spotty"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spotty-api = { path = "../spotty-api" }
+spotty-audio = { path = "../spotty-audio" }
+spotty-cache = { path = "../spotty-cache" }
+spotty-importer = { path = "../spotty-importer" }
+spotty-integrations = { path = "../spotty-integrations" }
+spotty-opml = { path = "../spotty-opml" }
+spotty-playlist-folders = { path = "../spotty-playlist-folders" }
+spotty-types = { path = "../spotty-types" }
+spotty-web = { path = "../spotty-web" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+wiremock = { workspace = true }

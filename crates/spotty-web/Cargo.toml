@@ -1,0 +1,23 @@
+[package]
+name = "spotty-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+spotty-api = { path = "../spotty-api" }
+spotty-audio = { path = "../spotty-audio" }
+spotty-cache = { path = "../spotty-cache" }
+spotty-opml = { path = "../spotty-opml" }
+spotty-playlist-folders = { path = "../spotty-playlist-folders" }
+spotty-types = { path = "../spotty-types" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
