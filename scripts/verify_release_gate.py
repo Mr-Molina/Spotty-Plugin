@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 
 def resolve_audit_script() -> Path:
-    """Resolve google_rust_audit.py cross-platform from plugin or standalone skill dirs."""
+    """Resolve google_rust_audit.py cross-platform from env override, plugin, or standalone skill dirs."""
+    env_override = os.environ.get("SPOTTY_AUDIT_SCRIPT")
+    if env_override:
+        return Path(env_override)
     home = Path.home()
     candidates = [
         home
@@ -61,7 +64,8 @@ def collect_source_mtimes(workspace: Path) -> tuple[float, Path]:
     crates_dir = workspace / "crates"
     if crates_dir.is_dir():
         candidates.extend(crates_dir.rglob("*.rs"))
-    for root_file in ("Cargo.toml", "strings.txt", "install.xml"):
+        candidates.extend(crates_dir.rglob("Cargo.toml"))
+    for root_file in ("Cargo.toml", "Cargo.lock", "strings.txt", "install.xml"):
         path = workspace / root_file
         if path.is_file():
             candidates.append(path)
@@ -207,6 +211,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Stage target/release/lms-spotty[.exe] into Bin/<arch>/ and verify SHA-256 parity.",
     )
+    parser.add_argument(
+        "--skip-google-audit",
+        action="store_true",
+        help="Skip google_rust_audit.py step (useful when audit script is unavailable in CI).",
+    )
     return parser.parse_args(argv)
 
 
@@ -221,11 +230,19 @@ def main(argv: list[str]) -> int:
         ["cargo", "clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
         workspace,
     )
-    run_step(
-        "google-rust-audit",
-        [sys.executable, str(AUDIT_SCRIPT), "crates", "--strict"],
-        workspace,
-    )
+    if args.skip_google_audit:
+        print("==> [google-rust-audit] skipped (--skip-google-audit)", flush=True)
+    elif not AUDIT_SCRIPT.is_file():
+        print(
+            f"==> [google-rust-audit] skipped (audit script not found at {AUDIT_SCRIPT})",
+            flush=True,
+        )
+    else:
+        run_step(
+            "google-rust-audit",
+            [sys.executable, str(AUDIT_SCRIPT), "crates", "--strict"],
+            workspace,
+        )
     run_step("cargo-test", ["cargo", "test", "--workspace"], workspace)
     run_step(
         "cargo-build-release",

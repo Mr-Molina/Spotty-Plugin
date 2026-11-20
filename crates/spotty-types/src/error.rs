@@ -89,6 +89,7 @@ impl From<serde_json::Error> for SpottyError {
 pub type Result<T> = std::result::Result<T, SpottyError>;
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 

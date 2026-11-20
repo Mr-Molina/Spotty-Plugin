@@ -582,7 +582,7 @@ fn build_obj_info_menu(meta: &ContextMetadata) -> Vec<OpmlNode> {
     let uri = meta.extid.as_deref();
 
     if let Some(spotify_uri) = uri.filter(|u| u.starts_with("spotify:")) {
-        if spotify_uri.contains("spotify:track") {
+        if spotify_uri.starts_with("spotify:track:") {
             let mut radio_pass = BTreeMap::new();
             radio_pass.insert(String::from("route"), String::from("track_radio"));
             radio_pass.insert(String::from("uri"), String::from(spotify_uri));

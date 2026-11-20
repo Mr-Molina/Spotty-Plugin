@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -20,7 +23,9 @@ use spotty_cache::MetadataWriteMode;
 use spotty_playlist_folders::FolderEntry;
 use spotty_types::AccountSwitcherVisibility;
 use spotty_types::AlbumScope;
+use spotty_types::ClientId;
 use spotty_types::GlobalPrefs;
+use spotty_types::LmsHostCallbacks;
 use spotty_types::PlayerPrefs;
 use spotty_types::Result;
 use spotty_types::SortOrder;
@@ -60,12 +65,14 @@ use crate::menus::add_track_to_playlist_action;
 use crate::menus::add_track_to_playlist_menu;
 use crate::menus::search_category_nodes;
 use crate::menus::track_or_artist_radio;
+use crate::menus::transfer_playback_from_spotify;
 use crate::menus::transfer_playback_menu;
 use crate::menus::PodcastCapability;
 use crate::menus::RadioSeedKind;
 use crate::search_lru::RecentSearchesStore;
 
 const MAX_LIBRARY_ITEMS: usize = 500;
+const FEATURED_CACHE_TTL: Duration = Duration::from_secs(300);
 const HOME_HERO_PREFIX: &str = "home_heroes_";
 const EMPTY_LIBRARY_PROMPT: &str =
     "Add albums to your music, or follow an artist or playlist to populate your music library.";
@@ -219,6 +226,8 @@ pub enum OpmlRoute {
     },
     /// Spotify Connect playback transfer menu (`transferPlaylist`).
     TransferPlaylist,
+    /// Execute Spotify Connect playback transfer (`do_transfer_playlist`).
+    DoTransferPlaylist,
     /// Recommendations seeded by a track (`trackRadio`).
     TrackRadio {
         /// Track URI or ID.
@@ -250,6 +259,15 @@ pub enum OpmlRoute {
         /// Wrapped OPML route.
         route: Box<OpmlRoute>,
     },
+    /// Paginated slice wrapper applying `offset` and `limit` to any route.
+    Paged {
+        /// Wrapped OPML route.
+        route: Box<OpmlRoute>,
+        /// Zero-based item offset.
+        offset: usize,
+        /// Maximum number of items to return.
+        limit: usize,
+    },
 }
 
 impl OpmlRoute {
@@ -280,10 +298,24 @@ pub struct OpmlFeedResponse {
     pub custom_client_limitations: bool,
     /// Optional LMS window navigation hint (`"parent"`, `"grandparent"`, etc.).
     pub next_window: Option<String>,
+    /// Zero-based item offset for paginated responses.
+    #[serde(default)]
+    pub offset: usize,
+    /// Page size limit when paginated (`None` if unpaged).
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Total number of available items before pagination slicing.
+    #[serde(default)]
+    pub total: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CachedFeatured {
+    fetched_at: Instant,
+    featured: FeaturedPlaylists,
 }
 
 /// Asynchronous 26-route OPML feed dispatcher (`OPML.pm:handleFeed`).
-#[derive(Debug)]
 pub struct OpmlRouter {
     client: SpotifyClient,
     global_prefs: GlobalPrefs,
@@ -296,6 +328,19 @@ pub struct OpmlRouter {
     recent_searches: Mutex<RecentSearchesStore>,
     folder_hierarchy: Option<HashMap<String, FolderEntry>>,
     custom_client_limitations: AtomicBool,
+    featured_cache: tokio::sync::Mutex<Option<(String, CachedFeatured)>>,
+    transfer_host: Option<Arc<dyn LmsHostCallbacks>>,
+    transfer_player_id: Option<ClientId>,
+}
+
+impl std::fmt::Debug for OpmlRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpmlRouter")
+            .field("client", &self.client)
+            .field("accounts", &self.accounts)
+            .field("custom_client_limitations", &self.custom_client_limitations)
+            .finish_non_exhaustive()
+    }
 }
 
 impl OpmlRouter {
@@ -323,7 +368,23 @@ impl OpmlRouter {
             recent_searches: Mutex::new(RecentSearchesStore::new()),
             folder_hierarchy: None,
             custom_client_limitations: AtomicBool::new(false),
+            featured_cache: tokio::sync::Mutex::new(None),
+            transfer_host: None,
+            transfer_player_id: None,
         }
+    }
+
+    /// Configures the [`LmsHostCallbacks`] target for
+    /// [`OpmlRoute::DoTransferPlaylist`].
+    #[must_use]
+    pub fn with_transfer_target(
+        mut self,
+        host: Arc<dyn LmsHostCallbacks>,
+        player_id: ClientId,
+    ) -> Self {
+        self.transfer_host = Some(host);
+        self.transfer_player_id = Some(player_id);
+        self
     }
 
     /// Configures podcast menu capability.
@@ -384,29 +445,35 @@ impl OpmlRouter {
     }
 
     /// Runs `f` with a read-only view of the router's recent-searches store.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the recent-searches mutex was poisoned by a prior panic.
     pub fn with_recent_searches_store<R>(&self, f: impl FnOnce(&RecentSearchesStore) -> R) -> R {
-        let guard = self
-            .recent_searches
-            .lock()
-            .expect("recent searches mutex is never poisoned");
-        f(&guard)
+        match self.recent_searches.lock() {
+            Ok(guard) => f(&guard),
+            Err(_) => {
+                let empty = RecentSearchesStore::new();
+                f(&empty)
+            }
+        }
     }
 
     /// Runs `f` with the currently active account identifier.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the active-account mutex was poisoned by a prior panic.
     pub fn with_active_account<R>(&self, f: impl FnOnce(&str) -> R) -> R {
-        let guard = self
-            .active_account
-            .lock()
-            .expect("active account mutex is never poisoned");
-        f(&guard)
+        match self.active_account.lock() {
+            Ok(guard) => f(&guard),
+            Err(_) => f(""),
+        }
+    }
+
+    fn resolve_account_client(&self, account_id: &str) -> Result<&SpotifyClient> {
+        let key = account_id.to_ascii_lowercase();
+        if let Some(client) = self.account_clients.get(&key) {
+            return Ok(client);
+        }
+        if account_id.eq_ignore_ascii_case(self.client.user_id()) {
+            return Ok(&self.client);
+        }
+        Err(SpottyError::InvalidUri(format!(
+            "unknown account: {account_id}"
+        )))
     }
 
     /// Dispatches `route` asynchronously and builds an [`OpmlFeedResponse`].
@@ -414,36 +481,63 @@ impl OpmlRouter {
     /// # Errors
     ///
     /// Returns [`SpottyError`] if the underlying Spotify Web API call or URI
-    /// parsing fails, or if an unknown `HomeHero` tag is supplied.
-    ///
-    /// # Panics
-    ///
-    /// Panics if internal account or search-history mutexes were poisoned by a
-    /// prior panic.
+    /// parsing fails, or if an unknown `HomeHero` tag or account is supplied.
     pub async fn handle_feed(&self, route: OpmlRoute) -> Result<OpmlFeedResponse> {
-        let (target_client, resolved_route) = match route {
+        let (route, page_spec) = match route {
+            OpmlRoute::Paged {
+                route: inner,
+                offset,
+                limit,
+            } => (*inner, Some((offset, limit))),
+            other => (other, None),
+        };
+
+        let mut resp = match route {
             OpmlRoute::WithAccount {
                 account_name,
                 route: inner,
             } => {
-                {
-                    let mut guard = self
-                        .active_account
-                        .lock()
-                        .expect("active account mutex is never poisoned");
-                    *guard = account_name.clone();
-                }
-                let selected = self
-                    .account_clients
-                    .get(&account_name.to_ascii_lowercase())
-                    .unwrap_or(&self.client);
-                selected.me().await?;
-                (selected, *inner)
+                let selected = self.resolve_account_client(&account_name)?;
+                let response = self.dispatch_route(selected, *inner).await?;
+                let mut guard = self.active_account.lock().map_err(|_| {
+                    SpottyError::Cache(String::from("active account mutex poisoned"))
+                })?;
+                *guard = account_name;
+                response
             }
-            other => (&self.client, other),
+            other => {
+                let active = self.with_active_account(str::to_owned);
+                let target_client = if active.eq_ignore_ascii_case(self.client.user_id()) {
+                    &self.client
+                } else {
+                    self.resolve_account_client(&active)?
+                };
+                self.dispatch_route(target_client, other).await?
+            }
         };
 
-        self.dispatch_route(target_client, resolved_route).await
+        Ok(match page_spec {
+            Some((offset, limit)) => apply_pagination(resp, offset, Some(limit)),
+            None => {
+                resp.total = resp.items.len();
+                resp
+            }
+        })
+    }
+
+    /// Dispatches `route` and returns a paginated slice `[offset..offset + limit]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpottyError`] if dispatching the underlying route fails.
+    pub async fn handle_feed_paged(
+        &self,
+        route: OpmlRoute,
+        offset: usize,
+        limit: usize,
+    ) -> Result<OpmlFeedResponse> {
+        let resp = self.handle_feed(route).await?;
+        Ok(apply_pagination(resp, offset, Some(limit)))
     }
 
     async fn dispatch_route(
@@ -474,12 +568,18 @@ impl OpmlRouter {
             OpmlRoute::MyShows => self.handle_my_shows(client).await,
             OpmlRoute::Show {
                 id_or_uri,
-                name: _,
+                name,
                 description,
                 languages,
             } => {
-                self.handle_show(client, &id_or_uri, description.as_deref(), &languages)
-                    .await
+                self.handle_show(
+                    client,
+                    &id_or_uri,
+                    name.as_deref(),
+                    description.as_deref(),
+                    &languages,
+                )
+                .await
             }
             OpmlRoute::AddShowToLibrary { ids } => {
                 let mut refs = Vec::with_capacity(ids.len());
@@ -560,6 +660,7 @@ impl OpmlRouter {
                     ..OpmlFeedResponse::default()
                 })
             }
+            OpmlRoute::DoTransferPlaylist => self.handle_do_transfer_playlist(client).await,
             OpmlRoute::TrackRadio { uri_or_id } => {
                 let items = track_or_artist_radio(
                     client,
@@ -614,11 +715,16 @@ impl OpmlRouter {
                 account_name,
                 route: inner,
             } => {
-                let selected = self
-                    .account_clients
-                    .get(&account_name.to_ascii_lowercase())
-                    .unwrap_or(client);
+                let selected = self.resolve_account_client(&account_name)?;
                 Box::pin(self.dispatch_route(selected, *inner)).await
+            }
+            OpmlRoute::Paged {
+                route: inner,
+                offset,
+                limit,
+            } => {
+                let resp = Box::pin(self.dispatch_route(client, *inner)).await?;
+                Ok(apply_pagination(resp, offset, Some(limit)))
             }
         }
     }
@@ -656,8 +762,30 @@ impl OpmlRouter {
         }
     }
 
-    async fn handle_root(&self, client: &SpotifyClient) -> Result<OpmlFeedResponse> {
+    async fn cached_featured_playlists(&self, client: &SpotifyClient) -> Result<FeaturedPlaylists> {
+        let user_key = client.user_id().to_ascii_lowercase();
+        {
+            let guard = self.featured_cache.lock().await;
+            if let Some((cached_user, entry)) = guard.as_ref() {
+                if *cached_user == user_key && entry.fetched_at.elapsed() < FEATURED_CACHE_TTL {
+                    return Ok(entry.featured.clone());
+                }
+            }
+        }
         let featured = client.featured_playlists(None, SPOTIFY_LIMIT).await?;
+        let mut guard = self.featured_cache.lock().await;
+        *guard = Some((
+            user_key,
+            CachedFeatured {
+                fetched_at: Instant::now(),
+                featured: featured.clone(),
+            },
+        ));
+        Ok(featured)
+    }
+
+    async fn handle_root(&self, client: &SpotifyClient) -> Result<OpmlFeedResponse> {
+        let featured = self.cached_featured_playlists(client).await?;
         let limited = is_limited(&featured);
         self.custom_client_limitations
             .store(limited, Ordering::Relaxed);
@@ -757,7 +885,7 @@ impl OpmlRouter {
         {
             let current_display = self.with_active_account(|active| {
                 for acc in &self.accounts {
-                    if acc.id == active {
+                    if acc.id.eq_ignore_ascii_case(active) {
                         return acc.display_name.clone();
                     }
                 }
@@ -894,7 +1022,7 @@ impl OpmlRouter {
                     });
                 }
                 SpotifyEntityKind::Show => {
-                    return self.handle_show(client, &colon_uri, None, &[]).await;
+                    return self.handle_show(client, &colon_uri, None, None, &[]).await;
                 }
                 SpotifyEntityKind::Track | SpotifyEntityKind::Episode => {
                     let maybe = client
@@ -911,35 +1039,16 @@ impl OpmlRouter {
                         ..OpmlFeedResponse::default()
                     });
                 }
-                SpotifyEntityKind::User | _ => {}
+                SpotifyEntityKind::User => {
+                    let user_id = parsed.id();
+                    return self.handle_user_lookup(client, user_id).await;
+                }
+                _ => {}
             }
         }
 
         if kind == Some(SearchTarget::User) {
-            let profile = client.user(query).await?;
-            let title = match &profile.display_name {
-                Some(dn) if !dn.is_empty() => format!("{dn} ({})", profile.id),
-                _ => profile.id.clone(),
-            };
-            let mut profile_node = OpmlNode::new(title, OpmlItemKind::Text);
-            profile_node.image = if profile.image.is_empty() {
-                Some(String::from(IMG_ACCOUNT))
-            } else {
-                Some(profile.image)
-            };
-
-            let mut pl_node = route_node(
-                "Playlists",
-                OpmlItemKind::Link,
-                IMG_PLAYLIST,
-                "my_playlists",
-            );
-            pl_node.passthrough.insert(String::from("user"), profile.id);
-
-            return Ok(OpmlFeedResponse {
-                items: vec![profile_node, pl_node],
-                ..OpmlFeedResponse::default()
-            });
+            return self.handle_user_lookup(client, query).await;
         }
 
         let search_kind = match kind {
@@ -970,10 +1079,9 @@ impl OpmlRouter {
                     &TrackListOptions::default(),
                 ));
                 if !is_recent {
-                    let mut guard = self
-                        .recent_searches
-                        .lock()
-                        .expect("recent searches mutex is never poisoned");
+                    let mut guard = self.recent_searches.lock().map_err(|_| {
+                        SpottyError::Cache(String::from("recent searches mutex poisoned"))
+                    })?;
                     guard.add(query);
                 }
                 Ok(OpmlFeedResponse {
@@ -1059,6 +1167,7 @@ impl OpmlRouter {
                 passthrough.insert(String::from("query"), String::from(term));
                 passthrough.insert(String::from("recent"), String::from("1"));
                 passthrough.insert(String::from("deleteMenu"), oldest_idx.to_string());
+                passthrough.insert(String::from("deleteTerm"), String::from(term));
 
                 let mut node = OpmlNode::new(term, OpmlItemKind::Link);
                 node.passthrough = passthrough;
@@ -1147,7 +1256,7 @@ impl OpmlRouter {
         );
         if items.is_empty() {
             items.push(OpmlNode::new(
-                "Please add songs to your music library to populate your this section.",
+                "Please add songs to your music library to populate this section.",
                 OpmlItemKind::Text,
             ));
         }
@@ -1247,6 +1356,7 @@ impl OpmlRouter {
         &self,
         client: &SpotifyClient,
         id_or_uri: &str,
+        name: Option<&str>,
         description: Option<&str>,
         languages: &[String],
     ) -> Result<OpmlFeedResponse> {
@@ -1286,6 +1396,7 @@ impl OpmlRouter {
         }
 
         Ok(OpmlFeedResponse {
+            name: name.map(str::to_owned),
             items,
             ..OpmlFeedResponse::default()
         })
@@ -1362,22 +1473,17 @@ impl OpmlRouter {
 
     async fn handle_select_account(
         &self,
-        client: &SpotifyClient,
+        _client: &SpotifyClient,
         account_id: Option<&str>,
     ) -> Result<OpmlFeedResponse> {
         if let Some(target_id) = account_id {
-            {
-                let mut guard = self
-                    .active_account
-                    .lock()
-                    .expect("active account mutex is never poisoned");
-                *guard = String::from(target_id);
-            }
-            let target_client = self
-                .account_clients
-                .get(&target_id.to_ascii_lowercase())
-                .unwrap_or(client);
+            let target_client = self.resolve_account_client(target_id)?;
             target_client.me().await?;
+            let mut guard = self
+                .active_account
+                .lock()
+                .map_err(|_| SpottyError::Cache(String::from("active account mutex poisoned")))?;
+            *guard = String::from(target_id);
             return Ok(OpmlFeedResponse {
                 next_window: Some(String::from("grandparent")),
                 ..OpmlFeedResponse::default()
@@ -1387,7 +1493,7 @@ impl OpmlRouter {
         let current = self.with_active_account(str::to_owned);
         let mut items = Vec::new();
         for account in &self.accounts {
-            if account.id == current {
+            if account.id.eq_ignore_ascii_case(&current) {
                 continue;
             }
             let mut passthrough = BTreeMap::new();
@@ -1403,6 +1509,83 @@ impl OpmlRouter {
             ..OpmlFeedResponse::default()
         })
     }
+
+    async fn handle_user_lookup(
+        &self,
+        client: &SpotifyClient,
+        user_id: &str,
+    ) -> Result<OpmlFeedResponse> {
+        let profile = client.user(user_id).await?;
+        let title = match &profile.display_name {
+            Some(dn) if !dn.is_empty() => format!("{dn} ({})", profile.id),
+            _ => profile.id.clone(),
+        };
+        let mut profile_node = OpmlNode::new(title, OpmlItemKind::Text);
+        profile_node.image = if profile.image.is_empty() {
+            Some(String::from(IMG_ACCOUNT))
+        } else {
+            Some(profile.image)
+        };
+
+        let mut pl_node = route_node(
+            "Playlists",
+            OpmlItemKind::Link,
+            IMG_PLAYLIST,
+            "my_playlists",
+        );
+        pl_node.passthrough.insert(String::from("user"), profile.id);
+
+        Ok(OpmlFeedResponse {
+            items: vec![profile_node, pl_node],
+            ..OpmlFeedResponse::default()
+        })
+    }
+
+    async fn handle_do_transfer_playlist(
+        &self,
+        client: &SpotifyClient,
+    ) -> Result<OpmlFeedResponse> {
+        let (Some(host), Some(player_id)) = (
+            self.transfer_host.as_ref(),
+            self.transfer_player_id.as_ref(),
+        ) else {
+            return Err(SpottyError::Audio(String::from(
+                "no LMS player target configured for playback transfer",
+            )));
+        };
+        let transferred = transfer_playback_from_spotify(client, host.as_ref(), player_id).await?;
+        let msg = if transferred {
+            "Transferring playback"
+        } else {
+            "No Spotify playing device was found."
+        };
+        Ok(OpmlFeedResponse {
+            items: vec![OpmlNode::new(msg, OpmlItemKind::Text)],
+            next_window: transferred.then(|| String::from("grandparent")),
+            ..OpmlFeedResponse::default()
+        })
+    }
+}
+
+fn apply_pagination(
+    mut resp: OpmlFeedResponse,
+    offset: usize,
+    limit: Option<usize>,
+) -> OpmlFeedResponse {
+    let total = resp.items.len();
+    resp.total = total;
+    resp.offset = offset;
+    resp.limit = limit;
+    if offset >= total {
+        resp.items.clear();
+        return resp;
+    }
+    let end = match limit {
+        Some(max) => offset.saturating_add(max).min(total),
+        None => total,
+    };
+    resp.items = resp.items.drain(offset..end).collect();
+    resp
 }
 
 fn is_limited(featured: &FeaturedPlaylists) -> bool {
@@ -1710,5 +1893,147 @@ mod tests {
         router.with_active_account(|active| {
             assert_eq!(active, "bob", "WithAccount must update active account");
         });
+    }
+
+    #[tokio::test]
+    async fn select_account_dispatches_subsequent_routes_and_rejects_unknown() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "bob",
+                "uri": "spotify:user:bob",
+                "display_name": "Bob"
+            })))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/browse/new-releases"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "albums": {
+                    "total": 2,
+                    "next": null,
+                    "items": [
+                        {
+                            "id": "a1",
+                            "uri": "spotify:album:a1",
+                            "name": "Album One",
+                            "album_type": "album",
+                            "artists": [{
+                                "id": "ar1",
+                                "uri": "spotify:artist:ar1",
+                                "name": "Artist"
+                            }],
+                            "images": []
+                        },
+                        {
+                            "id": "a2",
+                            "uri": "spotify:album:a2",
+                            "name": "Album Two",
+                            "album_type": "album",
+                            "artists": [{
+                                "id": "ar1",
+                                "uri": "spotify:artist:ar1",
+                                "name": "Artist"
+                            }],
+                            "images": []
+                        }
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp_alice = TempDir::new().expect("tempdir");
+        let tmp_bob = TempDir::new().expect("tempdir");
+        let alice_client = build_test_client_for_user(&server.uri(), &tmp_alice, "alice");
+        let bob_client = build_test_client_for_user(&server.uri(), &tmp_bob, "bob");
+
+        let router = OpmlRouter::new(alice_client, GlobalPrefs::default(), PlayerPrefs::default())
+            .with_accounts(vec![
+                RouterAccount::new("Alice", "Alice"),
+                RouterAccount::new("Bob", "Bob"),
+            ])
+            .with_account_client("bob", bob_client);
+
+        let unknown = router
+            .handle_feed(OpmlRoute::SelectAccount {
+                account_id: Some(String::from("mallory")),
+            })
+            .await;
+        assert!(unknown.is_err(), "unknown account must fail");
+        router.with_active_account(|active| assert_eq!(active, "alice"));
+
+        router
+            .handle_feed(OpmlRoute::SelectAccount {
+                account_id: Some(String::from("Bob")),
+            })
+            .await
+            .expect("valid account switch should succeed");
+        router.with_active_account(|active| assert_eq!(active, "Bob"));
+
+        let paged = router
+            .handle_feed(OpmlRoute::Paged {
+                route: Box::new(OpmlRoute::WhatsNew),
+                offset: 1,
+                limit: 1,
+            })
+            .await
+            .expect("paged WhatsNew should succeed");
+        assert_eq!(paged.total, 2);
+        assert_eq!(paged.offset, 1);
+        assert_eq!(paged.limit, Some(1));
+        assert_eq!(paged.items.len(), 1);
+        assert_eq!(paged.items[0].line1.as_deref(), Some("Album Two"));
+    }
+
+    #[tokio::test]
+    async fn show_preserves_name_and_user_uri_search_extracts_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/shows/show123/episodes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 0,
+                "next": null,
+                "items": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/users/targetuser"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "targetuser",
+                "uri": "spotify:user:targetuser",
+                "display_name": "Target User",
+                "images": []
+            })))
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let client = build_test_client(&server.uri(), &tmp);
+        let router = OpmlRouter::new(client, GlobalPrefs::default(), PlayerPrefs::default());
+
+        let show = router
+            .handle_feed(OpmlRoute::Show {
+                id_or_uri: String::from("spotify:show:show123"),
+                name: Some(String::from("My Podcast")),
+                description: None,
+                languages: Vec::new(),
+            })
+            .await
+            .expect("show route should succeed");
+        assert_eq!(show.name.as_deref(), Some("My Podcast"));
+
+        let user_resp = router
+            .handle_feed(OpmlRoute::Search {
+                query: String::from("spotify:user:targetuser"),
+                kind: Some(SearchTarget::User),
+                is_recent: false,
+            })
+            .await
+            .expect("user URI search should extract user ID");
+        assert_eq!(user_resp.items[0].name, "Target User (targetuser)");
     }
 }

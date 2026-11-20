@@ -1,14 +1,16 @@
 //! Low-level `redb` storage backend with two tables and TTL envelopes.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use redb::{Database, ReadableTable, TableDefinition};
+use redb::{Database, ReadableTable, Table, TableDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use spotty_types::{Result, SpottyError};
+use tracing::warn;
 
 const EPHEMERAL_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("ephemeral_kv");
 const METADATA_TABLE: TableDefinition<'_, &str, &str> = TableDefinition::new("metadata_90d");
@@ -50,10 +52,6 @@ impl CachedHttpEntry {
     pub fn is_expired_at(&self, now_epoch_secs: u64) -> bool {
         now_epoch_secs >= self.expires_at_epoch_secs
     }
-
-    fn has_revalidation_validators(&self) -> bool {
-        self.etag.is_some() || self.last_modified.is_some()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,11 +66,46 @@ impl CacheEnvelope {
     }
 }
 
+#[derive(Serialize)]
+struct CacheEnvelopeRef<'a> {
+    value: &'a Value,
+    expires_at_epoch_secs: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload")]
 enum EphemeralRecord {
     Kv(CacheEnvelope),
     Http(CachedHttpEntry),
+}
+
+#[derive(Serialize)]
+#[serde(tag = "kind", content = "payload")]
+enum EphemeralRecordRef<'a> {
+    Kv(CacheEnvelopeRef<'a>),
+    Http(&'a CachedHttpEntry),
+}
+
+#[derive(Deserialize)]
+struct ExpiryOnly {
+    expires_at_epoch_secs: u64,
+}
+
+#[derive(Deserialize)]
+struct HttpExpiryAndValidators<'a> {
+    expires_at_epoch_secs: u64,
+    #[serde(borrow)]
+    etag: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    last_modified: Option<Cow<'a, str>>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", content = "payload")]
+enum EphemeralExpiry<'a> {
+    Kv(ExpiryOnly),
+    #[serde(borrow)]
+    Http(HttpExpiryAndValidators<'a>),
 }
 
 /// Persistent `redb` store managing `ephemeral_kv` and `metadata_90d` tables.
@@ -124,15 +157,18 @@ impl RedbStore {
         value: &Value,
         expires_at_epoch_secs: u64,
     ) -> Result<()> {
-        let record = EphemeralRecord::Kv(CacheEnvelope {
-            value: value.clone(),
+        let record = EphemeralRecordRef::Kv(CacheEnvelopeRef {
+            value,
             expires_at_epoch_secs,
         });
         let payload = serde_json::to_string(&record)?;
         self.write_table_entry(EPHEMERAL_TABLE, key, &payload)
     }
 
-    /// Reads an ephemeral JSON value at `now_epoch_secs`, pruning it if expired.
+    /// Reads an unexpired ephemeral JSON value at `now_epoch_secs`.
+    ///
+    /// Expired entries are left for [`Self::prune_expired_at`] to remove so
+    /// read paths never acquire a write transaction.
     ///
     /// # Errors
     ///
@@ -150,7 +186,6 @@ impl RedbStore {
         };
 
         if envelope.is_expired_at(now_epoch_secs) {
-            let _removed = self.remove_table_entry(EPHEMERAL_TABLE, key)?;
             return Ok(None);
         }
 
@@ -173,7 +208,7 @@ impl RedbStore {
     /// Returns [`SpottyError::Json`] or [`SpottyError::Cache`] if persisting fails.
     pub fn put_http_entry(&self, key: &str, entry: &CachedHttpEntry) -> Result<()> {
         let storage_key = http_storage_key(key);
-        let record = EphemeralRecord::Http(entry.clone());
+        let record = EphemeralRecordRef::Http(entry);
         let payload = serde_json::to_string(&record)?;
         self.write_table_entry(EPHEMERAL_TABLE, &storage_key, &payload)
     }
@@ -232,15 +267,14 @@ impl RedbStore {
     ///
     /// Returns [`SpottyError::Json`] or [`SpottyError::Cache`] on failure.
     pub fn put_metadata(&self, key: &str, value: &Value, expires_at_epoch_secs: u64) -> Result<()> {
-        let envelope = CacheEnvelope {
-            value: value.clone(),
-            expires_at_epoch_secs,
-        };
-        let payload = serde_json::to_string(&envelope)?;
+        let payload = Self::encode_metadata_envelope(value, expires_at_epoch_secs)?;
         self.write_table_entry(METADATA_TABLE, key, &payload)
     }
 
-    /// Reads an unexpired metadata entry at `now_epoch_secs`, pruning if stale.
+    /// Reads an unexpired metadata entry at `now_epoch_secs`.
+    ///
+    /// Expired entries are left for [`Self::prune_expired_at`] to remove so
+    /// read paths never acquire a write transaction.
     ///
     /// # Errors
     ///
@@ -253,7 +287,6 @@ impl RedbStore {
 
         let envelope: CacheEnvelope = serde_json::from_str(&json_str)?;
         if envelope.is_expired_at(now_epoch_secs) {
-            let _removed = self.remove_table_entry(METADATA_TABLE, key)?;
             return Ok(None);
         }
 
@@ -289,14 +322,7 @@ impl RedbStore {
                 .map_err(map_cache_err)?;
             for row in eph_table.iter().map_err(map_cache_err)? {
                 let (key_guard, val_guard) = row.map_err(map_cache_err)?;
-                let record: EphemeralRecord = serde_json::from_str(val_guard.value())?;
-                let should_prune = match record {
-                    EphemeralRecord::Kv(env) => env.is_expired_at(now_epoch_secs),
-                    EphemeralRecord::Http(entry) => {
-                        entry.is_expired_at(now_epoch_secs) && !entry.has_revalidation_validators()
-                    }
-                };
-                if should_prune {
+                if should_prune_ephemeral(val_guard.value(), now_epoch_secs) {
                     expired_ephemeral.push(key_guard.value().to_owned());
                 }
             }
@@ -304,8 +330,7 @@ impl RedbStore {
             let meta_table = read_txn.open_table(METADATA_TABLE).map_err(map_cache_err)?;
             for row in meta_table.iter().map_err(map_cache_err)? {
                 let (key_guard, val_guard) = row.map_err(map_cache_err)?;
-                let envelope: CacheEnvelope = serde_json::from_str(val_guard.value())?;
-                if envelope.is_expired_at(now_epoch_secs) {
+                if should_prune_metadata(val_guard.value(), now_epoch_secs) {
                     expired_metadata.push(key_guard.value().to_owned());
                 }
             }
@@ -322,10 +347,15 @@ impl RedbStore {
                 .open_table(EPHEMERAL_TABLE)
                 .map_err(map_cache_err)?;
             for key in &expired_ephemeral {
-                if eph_table
-                    .remove(key.as_str())
+                let still_prunable = eph_table
+                    .get(key.as_str())
                     .map_err(map_cache_err)?
-                    .is_some()
+                    .is_some_and(|val| should_prune_ephemeral(val.value(), now_epoch_secs));
+                if still_prunable
+                    && eph_table
+                        .remove(key.as_str())
+                        .map_err(map_cache_err)?
+                        .is_some()
                 {
                     pruned += 1;
                 }
@@ -335,10 +365,15 @@ impl RedbStore {
                 .open_table(METADATA_TABLE)
                 .map_err(map_cache_err)?;
             for key in &expired_metadata {
-                if meta_table
-                    .remove(key.as_str())
+                let still_prunable = meta_table
+                    .get(key.as_str())
                     .map_err(map_cache_err)?
-                    .is_some()
+                    .is_some_and(|val| should_prune_metadata(val.value(), now_epoch_secs));
+                if still_prunable
+                    && meta_table
+                        .remove(key.as_str())
+                        .map_err(map_cache_err)?
+                        .is_some()
                 {
                     pruned += 1;
                 }
@@ -347,6 +382,41 @@ impl RedbStore {
         write_txn.commit().map_err(map_cache_err)?;
 
         Ok(pruned)
+    }
+
+    pub(crate) fn with_metadata_write_txn<R>(
+        &self,
+        f: impl FnOnce(&mut Table<'_, &str, &str>) -> Result<R>,
+    ) -> Result<R> {
+        let write_txn = self.db.begin_write().map_err(map_cache_err)?;
+        let result = {
+            let mut table = write_txn
+                .open_table(METADATA_TABLE)
+                .map_err(map_cache_err)?;
+            f(&mut table)?
+        };
+        write_txn.commit().map_err(map_cache_err)?;
+        Ok(result)
+    }
+
+    pub(crate) fn decode_metadata_envelope(raw: &str) -> Result<(Value, u64)> {
+        let envelope: CacheEnvelope = serde_json::from_str(raw)?;
+        Ok((envelope.value, envelope.expires_at_epoch_secs))
+    }
+
+    pub(crate) fn encode_metadata_envelope(
+        value: &Value,
+        expires_at_epoch_secs: u64,
+    ) -> Result<String> {
+        let envelope = CacheEnvelopeRef {
+            value,
+            expires_at_epoch_secs,
+        };
+        Ok(serde_json::to_string(&envelope)?)
+    }
+
+    pub(crate) fn map_err(err: impl fmt::Display) -> SpottyError {
+        map_cache_err(err)
     }
 
     fn read_table_entry(
@@ -406,7 +476,33 @@ fn map_cache_err(err: impl fmt::Display) -> SpottyError {
     SpottyError::Cache(err.to_string())
 }
 
+fn should_prune_ephemeral(raw: &str, now_epoch_secs: u64) -> bool {
+    match serde_json::from_str::<EphemeralExpiry<'_>>(raw) {
+        Ok(EphemeralExpiry::Kv(env)) => now_epoch_secs >= env.expires_at_epoch_secs,
+        Ok(EphemeralExpiry::Http(entry)) => {
+            now_epoch_secs >= entry.expires_at_epoch_secs
+                && entry.etag.is_none()
+                && entry.last_modified.is_none()
+        }
+        Err(err) => {
+            warn!(error = %err, "quarantining corrupt ephemeral cache entry");
+            true
+        }
+    }
+}
+
+fn should_prune_metadata(raw: &str, now_epoch_secs: u64) -> bool {
+    match serde_json::from_str::<ExpiryOnly>(raw) {
+        Ok(env) => now_epoch_secs >= env.expires_at_epoch_secs,
+        Err(err) => {
+            warn!(error = %err, "quarantining corrupt metadata cache entry");
+            true
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use serde_json::json;
     use tempfile::TempDir;
@@ -433,14 +529,15 @@ mod tests {
             reopened.ephemeral_at("token:abc", 999).expect("read ok"),
             Some(json!({"access": "xyz"}))
         );
-        // Reading at or past expiry prunes the entry and returns None.
+        // Reading at or past expiry returns None without opening a write txn.
         assert_eq!(
             reopened.ephemeral_at("token:abc", 1_000).expect("read ok"),
             None
         );
+        // Entry remains present until prune_expired_at removes it.
         assert_eq!(
             reopened.ephemeral_at("token:abc", 500).expect("read ok"),
-            None
+            Some(json!({"access": "xyz"}))
         );
 
         assert_eq!(
@@ -449,7 +546,11 @@ mod tests {
                 .expect("read ok"),
             Some(json!({"name": "Song"}))
         );
-        assert_eq!(reopened.prune_expired_at(2_000).expect("prune ok"), 1);
+        assert_eq!(reopened.prune_expired_at(2_000).expect("prune ok"), 2);
+        assert_eq!(
+            reopened.ephemeral_at("token:abc", 500).expect("read ok"),
+            None
+        );
         assert_eq!(
             reopened
                 .metadata_at("spotify:track:1", 1_500)
@@ -491,5 +592,39 @@ mod tests {
             .expect("stale entry must remain");
         assert_eq!(stale.etag.as_deref(), Some("\"etag-v1\""));
         assert_eq!(stale.body, r#"{"items":[]}"#);
+    }
+
+    #[test]
+    fn prune_expired_at_quarantines_corrupt_rows_without_aborting() {
+        let tmp = TempDir::new().expect("tempdir creation must succeed");
+        let store = RedbStore::open(tmp.path().join("corrupt.redb")).expect("open");
+
+        store
+            .put_ephemeral("valid:live", &json!({"ok": true}), 5_000)
+            .expect("put live");
+        store
+            .put_ephemeral("valid:expired", &json!({"ok": false}), 100)
+            .expect("put expired");
+        store
+            .with_metadata_write_txn(|table| {
+                table
+                    .insert("meta:corrupt", "{not-valid-json")
+                    .map_err(RedbStore::map_err)?;
+                Ok(())
+            })
+            .expect("seed corrupt row");
+
+        let pruned = store.prune_expired_at(1_000).expect("prune must not abort");
+        assert_eq!(pruned, 2);
+        assert_eq!(
+            store.ephemeral_at("valid:live", 1_000).expect("read live"),
+            Some(json!({"ok": true}))
+        );
+        assert_eq!(
+            store
+                .ephemeral_at("valid:expired", 50)
+                .expect("read expired"),
+            None
+        );
     }
 }

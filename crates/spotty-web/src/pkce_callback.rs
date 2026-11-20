@@ -35,11 +35,21 @@ pub const LMS_PLUGIN_ID_HEADER: &str = "X-LMS-Plugin-ID";
 /// Default plugin identifier sent in [`LMS_PLUGIN_ID_HEADER`].
 pub const DEFAULT_PLUGIN_ID: &str = "Plugins::Spotty::Plugin";
 
+/// Expected local LMS callback path for `lms_redirect_uri` validation.
+pub const LMS_CALLBACK_PATH: &str = "/plugins/Spotty/settings/callback";
+
 /// Skin override forced by `feedbackPage` so Material skin does not break.
 pub const CALLBACK_SKIN_OVERRIDE: &str = "Default";
 
 const PREPARE_TIMEOUT_SECS: u64 = 10;
 const PKCE_VERIFIER_TTL_SECS: u64 = 900;
+const CSRF_TOKEN_LEN: usize = 32;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct OAuthStatePayload {
+    nonce: String,
+    csrf: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct RelayPrepareResponse {
@@ -73,7 +83,7 @@ impl CallbackViewModel {
 
     fn failure(message: impl Into<String>) -> Self {
         Self {
-            auth_error: Some(message.into()),
+            auth_error: Some(escape_html(&message.into())),
             free_product: false,
             skin_override: CALLBACK_SKIN_OVERRIDE,
         }
@@ -186,8 +196,9 @@ impl PkceCallbackController {
         lms_redirect_uri: &str,
         user_agent: &str,
     ) -> Result<String> {
+        let validated_redirect = validate_lms_redirect_uri(lms_redirect_uri)?;
         let payload = json!({
-            "url": lms_redirect_uri,
+            "url": validated_redirect,
             "ua": user_agent,
         });
 
@@ -234,13 +245,20 @@ impl PkceCallbackController {
         };
 
         let pkce = PkceChallenge::generate();
+        let csrf_source = PkceChallenge::generate().verifier;
+        let csrf = csrf_source
+            .get(..CSRF_TOKEN_LEN)
+            .unwrap_or(csrf_source.as_str())
+            .to_owned();
+        let cache_key = pkce_verifier_cache_key(&csrf);
         self.cache.put_ephemeral(
-            PKCE_VERIFIER_CACHE_KEY,
+            &cache_key,
             &Value::String(pkce.verifier),
             Duration::from_secs(PKCE_VERIFIER_TTL_SECS),
         )?;
 
-        let state_json = serde_json::to_vec(&json!({ "nonce": nonce }))?;
+        let state_payload = OAuthStatePayload { nonce, csrf };
+        let state_json = serde_json::to_vec(&state_payload)?;
         let state = STANDARD.encode(state_json);
         let scope_str = SPOTIFY_AUTH_SCOPES.join(" ");
 
@@ -259,9 +277,10 @@ impl PkceCallbackController {
         Ok(auth_url.to_string())
     }
 
-    /// Exchanges the Spotify `?code` parameter using the cached PKCE verifier,
-    /// fetches `/v1/me` profile metadata, caches tokens, and materializes
-    /// `<spotty_dir>/__AUTHENTICATE__/credentials.json`.
+    /// Legacy OAuth callback entry point kept for backwards compatibility.
+    ///
+    /// Fails closed because OAuth CSRF `state` validation is mandatory; callers
+    /// should use [`Self::handle_oauth_callback_verified`].
     ///
     /// # Errors
     ///
@@ -272,16 +291,55 @@ impl PkceCallbackController {
         client_id: &IconCode,
         code: Option<&str>,
     ) -> Result<CallbackViewModel> {
+        self.handle_oauth_callback_verified(client_id, code, None, None, None)
+            .await
+    }
+
+    /// Validates OAuth `error` and `state` CSRF parameters, atomically consumes
+    /// the per-flow PKCE verifier, exchanges `?code`, fetches `/v1/me` profile
+    /// metadata, caches tokens, and materializes
+    /// `<spotty_dir>/__AUTHENTICATE__/credentials.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpottyError::Cache`] or [`SpottyError::Io`] if local cache or
+    /// credential materialization fails unexpectedly.
+    pub async fn handle_oauth_callback_verified(
+        &self,
+        client_id: &IconCode,
+        code: Option<&str>,
+        state: Option<&str>,
+        error: Option<&str>,
+        error_description: Option<&str>,
+    ) -> Result<CallbackViewModel> {
+        if let Some(err_code) = error.map(str::trim).filter(|val| !val.is_empty()) {
+            warn!(oauth_error = err_code, "OAuth callback returned error");
+            return Ok(CallbackViewModel::failure(format_oauth_error(
+                err_code,
+                error_description,
+            )));
+        }
+
+        let Some(raw_state) = state.map(str::trim).filter(|val| !val.is_empty()) else {
+            error!("OAuth callback invoked without required state parameter");
+            return Ok(CallbackViewModel::failure("Missing OAuth state"));
+        };
+
+        let Some(parsed_state) = parse_oauth_state(raw_state) else {
+            error!("OAuth callback invoked with malformed state parameter");
+            return Ok(CallbackViewModel::failure("Invalid OAuth state"));
+        };
+
+        let cache_key = pkce_verifier_cache_key(&parsed_state.csrf);
+        let Some(Value::String(code_verifier)) = self.cache.ephemeral_value(&cache_key)? else {
+            error!("OAuth callback missing or expired PKCE code_verifier");
+            return Ok(CallbackViewModel::failure("Invalid or expired OAuth state"));
+        };
+        let _consumed = self.cache.remove_ephemeral(&cache_key)?;
+
         let Some(auth_code) = code.map(str::trim).filter(|val| !val.is_empty()) else {
             error!("OAuth callback invoked without authorization code");
             return Ok(CallbackViewModel::failure("Missing authorization code"));
-        };
-
-        let Some(Value::String(code_verifier)) =
-            self.cache.ephemeral_value(PKCE_VERIFIER_CACHE_KEY)?
-        else {
-            error!("OAuth callback missing cached PKCE code_verifier");
-            return Ok(CallbackViewModel::failure("Missing PKCE code verifier"));
         };
 
         let bundle = match self
@@ -292,7 +350,7 @@ impl PkceCallbackController {
             Ok(bundle) => bundle,
             Err(err) => {
                 error!(error = %err, "PKCE token exchange failed");
-                return Ok(CallbackViewModel::failure(err.to_string()));
+                return Ok(CallbackViewModel::failure("Spotify token exchange failed"));
             }
         };
 
@@ -300,7 +358,9 @@ impl PkceCallbackController {
             Ok(json) => json,
             Err(err) => {
                 error!(error = %err, "Failed to get user profile");
-                return Ok(CallbackViewModel::failure(err.to_string()));
+                return Ok(CallbackViewModel::failure(
+                    "Failed to fetch Spotify user profile",
+                ));
             }
         };
 
@@ -314,7 +374,7 @@ impl PkceCallbackController {
             }
             Err(err) => {
                 error!(error = %err, "Failed to normalize /v1/me profile");
-                return Ok(CallbackViewModel::failure(err.to_string()));
+                return Ok(CallbackViewModel::failure("Invalid Spotify user profile"));
             }
         };
 
@@ -339,7 +399,6 @@ impl PkceCallbackController {
         let auth_dir = self.accounts.account_dir(&auth_id);
         let _creds_path =
             materialize_oauth_credentials(&auth_dir, &bundle.access_token, &profile.id)?;
-        let _removed = self.cache.remove_ephemeral(PKCE_VERIFIER_CACHE_KEY)?;
 
         let free_product = profile.product.as_deref().is_some_and(|tier| {
             tier.eq_ignore_ascii_case("free") || tier.eq_ignore_ascii_case("open")
@@ -375,6 +434,69 @@ impl PkceCallbackController {
         let parsed: Value = serde_json::from_str(&body)?;
         Ok(parsed)
     }
+}
+
+fn pkce_verifier_cache_key(csrf: &str) -> String {
+    format!("{PKCE_VERIFIER_CACHE_KEY}:{csrf}")
+}
+
+fn validate_lms_redirect_uri(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    let parsed = Url::parse(trimmed)
+        .map_err(|err| SpottyError::InvalidUri(format!("invalid lms_redirect_uri: {err}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(SpottyError::InvalidUri(String::from(
+            "lms_redirect_uri must use http or https scheme",
+        )));
+    }
+    if parsed.host_str().is_none_or(str::is_empty) {
+        return Err(SpottyError::InvalidUri(String::from(
+            "lms_redirect_uri must include a host",
+        )));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(SpottyError::InvalidUri(String::from(
+            "lms_redirect_uri must not embed userinfo",
+        )));
+    }
+    if parsed.path() != LMS_CALLBACK_PATH {
+        return Err(SpottyError::InvalidUri(format!(
+            "lms_redirect_uri path must be {LMS_CALLBACK_PATH}"
+        )));
+    }
+    Ok(parsed.to_string())
+}
+
+fn parse_oauth_state(raw_state: &str) -> Option<OAuthStatePayload> {
+    let decoded = STANDARD.decode(raw_state).ok()?;
+    let payload: OAuthStatePayload = serde_json::from_slice(&decoded).ok()?;
+    if payload.nonce.trim().is_empty() || payload.csrf.trim().is_empty() {
+        return None;
+    }
+    Some(payload)
+}
+
+fn format_oauth_error(err_code: &str, description: Option<&str>) -> String {
+    let desc = description.map(str::trim).filter(|val| !val.is_empty());
+    match desc {
+        Some(detail) => format!("OAuth authorization failed ({err_code}): {detail}"),
+        None => format!("OAuth authorization failed ({err_code})"),
+    }
+}
+
+pub(crate) fn escape_html(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            '\'' => escaped.push_str("&#x27;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -467,9 +589,11 @@ mod tests {
         let decoded_state = STANDARD.decode(raw_state).expect("valid base64 state");
         let state_json: Value = serde_json::from_slice(&decoded_state).expect("json state");
         assert_eq!(state_json["nonce"], "relay-nonce-xyz");
+        let csrf = state_json["csrf"].as_str().expect("csrf token present");
+        let cache_key = pkce_verifier_cache_key(csrf);
 
         let Value::String(cached_verifier) = cache
-            .ephemeral_value(PKCE_VERIFIER_CACHE_KEY)
+            .ephemeral_value(&cache_key)
             .expect("cache read")
             .expect("verifier cached")
         else {
@@ -515,9 +639,15 @@ mod tests {
             .await;
 
         let callback_vm = controller
-            .handle_oauth_callback(&client_id, Some("auth-code-123"))
+            .handle_oauth_callback_verified(
+                &client_id,
+                Some("auth-code-123"),
+                Some(raw_state),
+                None,
+                None,
+            )
             .await
-            .expect("handle_oauth_callback should succeed");
+            .expect("handle_oauth_callback_verified should succeed");
 
         assert_eq!(callback_vm.auth_error, None);
         assert!(callback_vm.free_product);
@@ -581,9 +711,17 @@ mod tests {
         ));
 
         let tilde_verifier = format!("{}~{}", "a".repeat(63), "b".repeat(64));
+        let csrf = "csrf-tilde-test";
+        let state = STANDARD.encode(
+            serde_json::to_vec(&OAuthStatePayload {
+                nonce: String::from("nonce-tilde"),
+                csrf: String::from(csrf),
+            })
+            .expect("state json"),
+        );
         cache
             .put_ephemeral(
-                PKCE_VERIFIER_CACHE_KEY,
+                &pkce_verifier_cache_key(csrf),
                 &Value::String(tilde_verifier.clone()),
                 Duration::from_secs(300),
             )
@@ -635,11 +773,154 @@ mod tests {
         );
 
         let vm = controller
-            .handle_oauth_callback(&IconCode::default(), Some("tilde-code"))
+            .handle_oauth_callback_verified(
+                &IconCode::default(),
+                Some("tilde-code"),
+                Some(&state),
+                None,
+                None,
+            )
             .await
             .expect("callback should succeed");
         assert_eq!(vm.auth_error, None);
         assert!(!vm.free_product);
         assert_eq!(vm.skin_override, "Default");
+    }
+
+    #[tokio::test]
+    async fn legacy_callback_fails_closed_without_state_and_replay_is_blocked() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().expect("temp dir");
+        let cache = Arc::new(DualCache::open(dir.path().join("cache.redb")).expect("cache"));
+        let accounts = Arc::new(AccountStore::new(dir.path()));
+        let tokens =
+            Arc::new(TokenManager::new(Arc::clone(&cache), Arc::clone(&accounts)).expect("tm"));
+
+        Mock::given(method("POST"))
+            .and(path("/auth/prepare"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nonce": "nonce-1"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let controller = PkceCallbackController::with_endpoints(
+            format!("{}/auth/prepare", server.uri()),
+            format!("{}/auth/callback", server.uri()),
+            "https://accounts.spotify.com/authorize",
+            format!("{}/v1", server.uri()),
+            Client::new(),
+            Arc::clone(&cache),
+            Arc::clone(&accounts),
+            Arc::clone(&tokens),
+        );
+
+        let redirect_url = controller
+            .prepare_oauth_redirect(
+                &IconCode::default(),
+                "http://lms.local:9000/plugins/Spotty/settings/callback",
+                "Mozilla/5.0",
+            )
+            .await
+            .expect("prepare succeeds");
+        let parsed = Url::parse(&redirect_url).expect("url");
+        let state = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
+            .expect("state present");
+
+        // Legacy method must fail closed without state.
+        let legacy_vm = controller
+            .handle_oauth_callback(&IconCode::default(), Some("code-123"))
+            .await
+            .expect("returns vm");
+        assert_eq!(legacy_vm.auth_error.as_deref(), Some("Missing OAuth state"));
+
+        // Mismatched state must be rejected.
+        let bad_state = STANDARD.encode(br#"{"nonce":"nonce-1","csrf":"wrong"}"#);
+        let bad_vm = controller
+            .handle_oauth_callback_verified(
+                &IconCode::default(),
+                Some("code-123"),
+                Some(&bad_state),
+                None,
+                None,
+            )
+            .await
+            .expect("returns vm");
+        assert_eq!(
+            bad_vm.auth_error.as_deref(),
+            Some("Invalid or expired OAuth state")
+        );
+
+        // Consuming valid state on a missing-code failure must prevent replay.
+        let missing_code_vm = controller
+            .handle_oauth_callback_verified(&IconCode::default(), None, Some(&state), None, None)
+            .await
+            .expect("returns vm");
+        assert_eq!(
+            missing_code_vm.auth_error.as_deref(),
+            Some("Missing authorization code")
+        );
+
+        let replay_vm = controller
+            .handle_oauth_callback_verified(
+                &IconCode::default(),
+                Some("code-123"),
+                Some(&state),
+                None,
+                None,
+            )
+            .await
+            .expect("returns vm");
+        assert_eq!(
+            replay_vm.auth_error.as_deref(),
+            Some("Invalid or expired OAuth state")
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_rejects_unvalidated_lms_redirect_uri_and_escapes_oauth_errors() {
+        let dir = TempDir::new().expect("temp dir");
+        let cache = Arc::new(DualCache::open(dir.path().join("cache.redb")).expect("cache"));
+        let accounts = Arc::new(AccountStore::new(dir.path()));
+        let tokens =
+            Arc::new(TokenManager::new(Arc::clone(&cache), Arc::clone(&accounts)).expect("tm"));
+        let controller = PkceCallbackController::new(cache, accounts, tokens).expect("ctrl");
+
+        let bad_scheme = controller
+            .prepare_oauth_redirect(
+                &IconCode::default(),
+                "javascript:alert(1)//plugins/Spotty/settings/callback",
+                "Mozilla/5.0",
+            )
+            .await;
+        assert!(bad_scheme.is_err());
+
+        let bad_path = controller
+            .prepare_oauth_redirect(
+                &IconCode::default(),
+                "https://evil.example/steal",
+                "Mozilla/5.0",
+            )
+            .await;
+        assert!(bad_path.is_err());
+
+        let err_vm = controller
+            .handle_oauth_callback_verified(
+                &IconCode::default(),
+                None,
+                None,
+                Some("access_denied"),
+                Some("<script>alert('xss')</script>"),
+            )
+            .await
+            .expect("returns vm");
+        let auth_err = err_vm.auth_error.expect("auth_error present");
+        assert!(!auth_err.contains('<'));
+        assert!(!auth_err.contains('>'));
+        assert!(auth_err.contains("&lt;script&gt;"));
     }
 }

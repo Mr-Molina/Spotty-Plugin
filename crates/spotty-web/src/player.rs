@@ -7,7 +7,7 @@ use spotty_api::{NormalizedPlaylist, SpotifyClient, SPOTIFY_LIMIT};
 use spotty_audio::HelperCapabilities;
 use spotty_opml::sort_home_items;
 use spotty_types::{
-    ExplicitFilterMode, PlayerPrefs, PodcastEpisodeOrder, ReplayGainPolicy, Result,
+    ExplicitFilterMode, PlayerPrefs, PodcastEpisodeOrder, ReplayGainPolicy, Result, SpottyError,
 };
 
 const HOME_ITEM_PREF_PREFIX: &str = "pref_homeItem_";
@@ -43,6 +43,8 @@ pub struct PlayerSettingsViewModel {
     /// Whether the Spotty helper supports Spotify autoplay continuation.
     #[serde(rename = "canAutoplay")]
     pub can_autoplay: bool,
+    /// Whether per-player Spotify autoplay continuation is enabled (`autoplay`).
+    pub autoplay: bool,
     /// Sorted list of Home menu section toggles for this player.
     #[serde(rename = "homeItems")]
     pub home_items: Vec<HomeMenuItemOption>,
@@ -113,10 +115,17 @@ impl PlayerSettingsController {
         prefs: &mut PlayerPrefs,
         params: &HashMap<String, String>,
     ) -> Result<PlayerSettingsViewModel> {
+        let parsed = parse_player_scalar_prefs(params)?;
         let playlists = client.home(self.home_limit).await?;
-        apply_player_scalar_prefs(prefs, params);
-        apply_home_item_toggles(&playlists, prefs, params);
-        Ok(self.build_view_model(playlists, prefs))
+        apply_parsed_scalar_prefs(prefs, &parsed);
+        if should_apply_home_toggles(params) {
+            apply_home_item_toggles(&playlists, prefs, params);
+        }
+        let mut vm = self.build_view_model(playlists, prefs);
+        if let Some(autoplay) = parsed.autoplay {
+            vm.autoplay = self.can_autoplay && autoplay;
+        }
+        Ok(vm)
     }
 
     /// Builds a [`PlayerSettingsViewModel`] from already-fetched Home items.
@@ -129,6 +138,7 @@ impl PlayerSettingsController {
         let home_items = build_home_menu_items(playlists, &prefs.ignore_home_items);
         PlayerSettingsViewModel {
             can_autoplay: self.can_autoplay,
+            autoplay: false,
             home_items,
             replaygain: prefs.replaygain == ReplayGainPolicy::ClientEnabled,
             filter_explicit_content: explicit_filter_to_u8(prefs.explicit_filter),
@@ -198,30 +208,73 @@ pub fn apply_home_item_toggles(
     }
 }
 
-fn apply_player_scalar_prefs(prefs: &mut PlayerPrefs, params: &HashMap<String, String>) {
-    if let Some(val) = lookup_pref_param(params, "replaygain") {
-        prefs.replaygain = if is_truthy_param(val) {
+struct ParsedScalarPrefs {
+    replaygain: Option<ReplayGainPolicy>,
+    explicit_filter: Option<ExplicitFilterMode>,
+    podcast_order: Option<PodcastEpisodeOrder>,
+    autoplay: Option<bool>,
+}
+
+fn parse_player_scalar_prefs(params: &HashMap<String, String>) -> Result<ParsedScalarPrefs> {
+    let replaygain = lookup_pref_param(params, "replaygain").map(|val| {
+        if is_truthy_param(val) {
             ReplayGainPolicy::ClientEnabled
         } else {
             ReplayGainPolicy::Disabled
-        };
-    }
+        }
+    });
 
-    if let Some(val) = lookup_pref_param(params, "filterExplicitContent") {
-        prefs.explicit_filter = match val.trim() {
+    let explicit_filter = match lookup_pref_param(params, "filterExplicitContent") {
+        Some(val) => Some(match val.trim() {
+            "0" => ExplicitFilterMode::AllowAll,
             "1" => ExplicitFilterMode::HideExplicit,
             "2" => ExplicitFilterMode::StrictMaster,
-            _ => ExplicitFilterMode::AllowAll,
-        };
-    }
+            other => {
+                return Err(SpottyError::InvalidUri(format!(
+                    "invalid filterExplicitContent value: {other}"
+                )));
+            }
+        }),
+        None => None,
+    };
 
-    if let Some(val) = lookup_pref_param(params, "reversePodcastOrder") {
-        prefs.podcast_order = if is_truthy_param(val) {
+    let podcast_order = lookup_pref_param(params, "reversePodcastOrder").map(|val| {
+        if is_truthy_param(val) {
             PodcastEpisodeOrder::ReverseNewestFirst
         } else {
             PodcastEpisodeOrder::OldestFirst
-        };
+        }
+    });
+
+    let autoplay = lookup_pref_param(params, "autoplay").map(is_truthy_param);
+
+    Ok(ParsedScalarPrefs {
+        replaygain,
+        explicit_filter,
+        podcast_order,
+        autoplay,
+    })
+}
+
+fn apply_parsed_scalar_prefs(prefs: &mut PlayerPrefs, parsed: &ParsedScalarPrefs) {
+    if let Some(replaygain) = parsed.replaygain {
+        prefs.replaygain = replaygain;
     }
+    if let Some(explicit_filter) = parsed.explicit_filter {
+        prefs.explicit_filter = explicit_filter;
+    }
+    if let Some(podcast_order) = parsed.podcast_order {
+        prefs.podcast_order = podcast_order;
+    }
+}
+
+fn should_apply_home_toggles(params: &HashMap<String, String>) -> bool {
+    params
+        .get("saveSettings")
+        .is_some_and(|val| is_truthy_param(val))
+        || params
+            .keys()
+            .any(|key| key.starts_with(HOME_ITEM_PREF_PREFIX))
 }
 
 fn lookup_pref_param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str> {
@@ -473,5 +526,62 @@ mod tests {
         );
         assert_eq!(view.filter_explicit_content, 2);
         assert!(view.replaygain);
+    }
+
+    #[tokio::test]
+    async fn save_prefs_rejects_invalid_explicit_filter_and_guards_home_toggles() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().expect("tempdir allocation must succeed");
+        let client = build_test_spotify_client(&server.uri(), &tmp);
+
+        let home_path = format!("/v1/browse/categories/{PERSONAL_MIX_CATEGORY}/playlists");
+        Mock::given(method("GET"))
+            .and(path(home_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "playlists": {
+                    "total": 1,
+                    "next": null,
+                    "items": [
+                        {
+                            "id": "dm1",
+                            "uri": "spotify:playlist:dm1",
+                            "name": "Daily Mix 1",
+                            "owner": {"id": "spotify"},
+                            "images": []
+                        }
+                    ]
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let mut prefs = PlayerPrefs::default();
+        let mut bad_params = HashMap::new();
+        bad_params.insert(
+            String::from("pref_filterExplicitContent"),
+            String::from("99"),
+        );
+        let controller = PlayerSettingsController::default();
+        let err = controller
+            .save_prefs(&client, &mut prefs, &bad_params)
+            .await;
+        assert!(
+            err.is_err(),
+            "invalid filterExplicitContent must be rejected"
+        );
+
+        // Scalar-only update without saveSettings or pref_homeItem_* must
+        // not hide Home items.
+        let mut scalar_params = HashMap::new();
+        scalar_params.insert(String::from("pref_autoplay"), String::from("1"));
+        let vm = controller
+            .save_prefs(&client, &mut prefs, &scalar_params)
+            .await
+            .expect("scalar save_prefs must succeed");
+        assert!(vm.autoplay);
+        assert!(
+            !prefs.ignore_home_items.contains("dm1"),
+            "dm1 must not be hidden when home toggles were not submitted"
+        );
     }
 }

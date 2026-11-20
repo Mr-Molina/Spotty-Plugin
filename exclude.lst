@@ -1,4 +1,5 @@
 Spotty/README.md
+Spotty/README-RUST.md
 Spotty/**/README.md
 Spotty/**/spotty-custom*
 Spotty/**/findSpotifyFolderFiles.*
@@ -6,3 +7,9 @@ Spotty/**/test.sh
 Spotty/cloud*
 Spotty/target/**
 Spotty/crates/**
+Spotty/Cargo.toml
+Spotty/Cargo.lock
+Spotty/rustfmt.toml
+Spotty/scripts/**
+Spotty/.agents/**
+Spotty/docs/**

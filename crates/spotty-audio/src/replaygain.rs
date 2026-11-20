@@ -42,20 +42,34 @@ pub enum ServerReplayGainMode {
     Smart,
 }
 
-/// Resolves the effective LMS `trackGain` value for a remote Spotify stream.
+/// Minimum valid `ReplayGain` adjustment in dB.
+pub const MIN_REPLAY_GAIN_DB: f32 = -30.0;
+
+/// Maximum valid `ReplayGain` adjustment in dB.
+pub const MAX_REPLAY_GAIN_DB: f32 = 20.0;
+
+fn sanitize_gain(gain: Option<f32>) -> Option<f32> {
+    gain.filter(|value| value.is_finite())
+        .map(|value| value.clamp(MIN_REPLAY_GAIN_DB, MAX_REPLAY_GAIN_DB))
+}
+
+/// Resolves the effective LMS `trackGain` value for a remote Spotify stream,
+/// supporting separate track and album `ReplayGain` metadata.
 ///
-/// Matches `ProtocolHandler.pm:38-49`:
 /// - Returns `None` whenever `spotty_client_replaygain` is
 ///   [`ReplayGainPolicy::ClientEnabled`], preventing double `ReplayGain`
 ///   attenuation when `librespot` performs normalisation itself.
-/// - Otherwise returns `remote_replay_gain` when `server_mode` is not
-///   [`ServerReplayGainMode::Disabled`], or `None` when server `ReplayGain` is
-///   disabled.
+/// - Rejects `NaN` / `±inf` values and clamps finite gains to
+///   `[`[`MIN_REPLAY_GAIN_DB`]`, `[`MAX_REPLAY_GAIN_DB`]`]`.
+/// - Selects `remote_track_gain` in [`ServerReplayGainMode::Track`], and
+///   prefers `remote_album_gain` (falling back to `remote_track_gain`) in
+///   [`ServerReplayGainMode::Album`] and [`ServerReplayGainMode::Smart`].
 #[must_use]
-pub fn resolve_lms_track_gain(
+pub fn resolve_lms_gain(
     spotty_client_replaygain: ReplayGainPolicy,
     server_mode: ServerReplayGainMode,
-    remote_replay_gain: Option<f32>,
+    remote_track_gain: Option<f32>,
+    remote_album_gain: Option<f32>,
 ) -> Option<f32> {
     if spotty_client_replaygain == ReplayGainPolicy::ClientEnabled {
         return None;
@@ -63,10 +77,30 @@ pub fn resolve_lms_track_gain(
 
     match server_mode {
         ServerReplayGainMode::Disabled => None,
-        ServerReplayGainMode::Track | ServerReplayGainMode::Album | ServerReplayGainMode::Smart => {
-            remote_replay_gain
+        ServerReplayGainMode::Track => sanitize_gain(remote_track_gain),
+        ServerReplayGainMode::Album | ServerReplayGainMode::Smart => {
+            sanitize_gain(remote_album_gain).or_else(|| sanitize_gain(remote_track_gain))
         }
     }
+}
+
+/// Resolves the effective LMS `trackGain` value for a remote Spotify stream.
+///
+/// Backward-compatible wrapper around [`resolve_lms_gain`] when only track
+/// gain is available. Rejects non-finite (`NaN`/`±inf`) inputs and clamps
+/// finite values to `[`[`MIN_REPLAY_GAIN_DB`]`, `[`MAX_REPLAY_GAIN_DB`]`]`.
+#[must_use]
+pub fn resolve_lms_track_gain(
+    spotty_client_replaygain: ReplayGainPolicy,
+    server_mode: ServerReplayGainMode,
+    remote_replay_gain: Option<f32>,
+) -> Option<f32> {
+    resolve_lms_gain(
+        spotty_client_replaygain,
+        server_mode,
+        remote_replay_gain,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -128,6 +162,87 @@ mod tests {
         assert_eq!(
             NormalisationMode::from(ReplayGainPolicy::ClientEnabled),
             NormalisationMode::Enabled
+        );
+    }
+
+    #[test]
+    fn rejects_non_finite_and_clamps_extreme_replay_gains() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                resolve_lms_track_gain(
+                    ReplayGainPolicy::Disabled,
+                    ServerReplayGainMode::Track,
+                    Some(bad),
+                ),
+                None,
+                "non-finite gain {bad:?} must be rejected"
+            );
+        }
+
+        assert_eq!(
+            resolve_lms_track_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Track,
+                Some(-55.0),
+            ),
+            Some(MIN_REPLAY_GAIN_DB)
+        );
+        assert_eq!(
+            resolve_lms_track_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Track,
+                Some(42.0),
+            ),
+            Some(MAX_REPLAY_GAIN_DB)
+        );
+    }
+
+    #[test]
+    fn resolve_lms_gain_distinguishes_track_album_and_smart_modes() {
+        assert_eq!(
+            resolve_lms_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Track,
+                Some(-5.0),
+                Some(-8.0),
+            ),
+            Some(-5.0)
+        );
+        assert_eq!(
+            resolve_lms_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Album,
+                Some(-5.0),
+                Some(-8.0),
+            ),
+            Some(-8.0)
+        );
+        assert_eq!(
+            resolve_lms_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Smart,
+                Some(-5.0),
+                Some(-8.0),
+            ),
+            Some(-8.0)
+        );
+        assert_eq!(
+            resolve_lms_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Album,
+                Some(-5.0),
+                None,
+            ),
+            Some(-5.0)
+        );
+        assert_eq!(
+            resolve_lms_gain(
+                ReplayGainPolicy::Disabled,
+                ServerReplayGainMode::Album,
+                Some(-5.0),
+                Some(f32::NAN),
+            ),
+            Some(-5.0)
         );
     }
 }

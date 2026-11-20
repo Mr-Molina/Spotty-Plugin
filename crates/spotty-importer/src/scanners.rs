@@ -4,7 +4,7 @@
 //! `scanPlaylists`, `Importer.pm:74-303`).
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{Map, Value};
 use spotty_api::{
@@ -15,13 +15,22 @@ use spotty_cache::{DualCache, MetadataWriteMode};
 use spotty_types::{Result, SortOrder, TagCleanupPolicy};
 
 use crate::schema_sink::LibrarySink;
-use crate::track_prep::prepare_lms_track;
+use crate::track_prep::{prepare_lms_track, LmsTrackRow};
 
 /// Retention TTL in seconds for scanner watermarks (`86_400 * 7`, 7 days).
 pub const WATERMARK_TTL_SECS: u64 = 86_400 * 7;
 
 /// Refresh interval in seconds for Spotify-owned editorial playlists (24h).
 pub const SPOTIFY_EDITORIAL_REFRESH_SECS: u64 = 86_400;
+
+const ALBUM_STORE_CHUNK_SIZE: usize = 200;
+const TEN_DIGIT_SENTINEL_LEN: usize = 10;
+
+fn current_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
 
 /// Scans saved Spotify albums for `user_id`, hydrates missing artwork, stores
 /// prepared LMS tracks into `sink`, and persists the 7-day album watermark.
@@ -42,6 +51,37 @@ pub async fn scan_enabled_albums(
     split_sep: char,
     tag_cleanup: TagCleanupPolicy,
 ) -> Result<usize> {
+    scan_enabled_albums_at(
+        api,
+        user_id,
+        account_tag,
+        cache,
+        sink,
+        split_sep,
+        tag_cleanup,
+        current_epoch_secs(),
+    )
+    .await
+}
+
+/// Scans saved Spotify albums using an explicit `now_epoch_secs` clock.
+///
+/// # Errors
+///
+/// Returns [`spotty_types::SpottyError`] if Spotify API requests, cache
+/// operations, or `SQLite` sink writes fail.
+#[allow(clippy::too_many_arguments)]
+pub async fn scan_enabled_albums_at(
+    api: &SpotifyClient,
+    user_id: &str,
+    account_tag: Option<&str>,
+    cache: &DualCache,
+    sink: &mut dyn LibrarySink,
+    split_sep: char,
+    tag_cleanup: TagCleanupPolicy,
+    now_epoch_secs: u64,
+) -> Result<usize> {
+    let meta = api.my_albums_meta().await?;
     let mut albums = api
         .my_albums(
             MetadataWriteMode::MergeExisting,
@@ -57,9 +97,13 @@ pub async fn scan_enabled_albums(
         if album.id.is_empty() {
             continue;
         }
-        let needs_hydration = match cache.metadata_value(&album.uri)? {
-            Some(cached) => !has_non_empty_image(&cached) || album.image.is_empty(),
-            None => true,
+        let needs_hydration = if album.image.is_empty() {
+            true
+        } else {
+            match cache.metadata_value_at(&album.uri, now_epoch_secs)? {
+                Some(cached) => !has_non_empty_image(&cached),
+                None => true,
+            }
         };
         if needs_hydration && seen_missing.insert(album.id.clone()) {
             missing_ids.push(album.id.as_str());
@@ -71,19 +115,24 @@ pub async fn scan_enabled_albums(
         merge_hydrated_albums(&mut albums, hydrated);
     }
 
-    let last_added = albums
-        .first()
-        .and_then(|album| album.added_at.as_deref())
+    let last_added = meta
+        .latest_added_at
+        .as_deref()
+        .or_else(|| albums.first().and_then(|album| album.added_at.as_deref()))
         .unwrap_or("");
-    let watermark = format!("{}:{last_added}", albums.len());
+    let watermark = format!("{}:{last_added}", meta.total);
     let watermark_key = format!("spotty_latest_album_update{user_id}");
-    cache.put_ephemeral(
+    cache.put_ephemeral_at(
         &watermark_key,
         &Value::String(watermark),
-        Duration::from_secs(WATERMARK_TTL_SECS),
+        WATERMARK_TTL_SECS,
+        now_epoch_secs,
     )?;
 
     let mut total_stored = 0_usize;
+    let mut batch: Vec<LmsTrackRow> = Vec::with_capacity(ALBUM_STORE_CHUNK_SIZE);
+    let mut cached_tracks: HashMap<String, Option<NormalizedTrack>> = HashMap::new();
+
     for album in &albums {
         if album.tracks.is_empty() {
             continue;
@@ -100,24 +149,36 @@ pub async fn scan_enabled_albums(
             u32::try_from(album.tracks.len()).unwrap_or(u32::MAX)
         };
 
-        let mut rows = Vec::with_capacity(album.tracks.len());
         for track in &album.tracks {
             if !track.is_playable {
                 continue;
             }
-            let cached_track = load_cached_track(cache, &track.uri, album)?;
+            let cached_track = if let Some(cached) = cached_tracks.get(&track.uri) {
+                cached.as_ref()
+            } else {
+                let loaded = load_cached_track(cache, &track.uri, album)?;
+                cached_tracks.insert(track.uri.clone(), loaded);
+                cached_tracks.get(&track.uri).and_then(Option::as_ref)
+            };
             let row = prepare_lms_track(
                 track,
-                cached_track.as_ref(),
+                cached_track,
                 max_disc,
                 album_track_count,
                 split_sep,
                 tag_cleanup,
                 account_tag,
             );
-            rows.push(row);
+            batch.push(row);
+            if batch.len() >= ALBUM_STORE_CHUNK_SIZE {
+                total_stored = total_stored.saturating_add(sink.store_tracks(&batch)?);
+                batch.clear();
+            }
         }
-        total_stored = total_stored.saturating_add(sink.store_tracks(&rows)?);
+    }
+
+    if !batch.is_empty() {
+        total_stored = total_stored.saturating_add(sink.store_tracks(&batch)?);
     }
 
     Ok(total_stored)
@@ -140,22 +201,46 @@ pub async fn scan_enabled_artists(
     sink: &mut dyn LibrarySink,
     articles: &[&str],
 ) -> Result<usize> {
+    scan_enabled_artists_at(api, user_id, cache, sink, articles, current_epoch_secs()).await
+}
+
+/// Scans followed Spotify artists using an explicit `now_epoch_secs` clock.
+///
+/// # Errors
+///
+/// Returns [`spotty_types::SpottyError`] if Spotify API requests, cache
+/// operations, or `SQLite` contributor upserts fail.
+pub async fn scan_enabled_artists_at(
+    api: &SpotifyClient,
+    user_id: &str,
+    cache: &DualCache,
+    sink: &mut dyn LibrarySink,
+    articles: &[&str],
+    now_epoch_secs: u64,
+) -> Result<usize> {
     let artists_lib = api
         .my_artists(ArtistsScope::FollowedOnly, SortOrder::NaturalOrder)
         .await?;
 
     let watermark = format!("{}:{}", artists_lib.artists.len(), artists_lib.md5_hash);
     let watermark_key = format!("spotty_latest_artists_update{user_id}");
-    cache.put_ephemeral(
+    cache.put_ephemeral_at(
         &watermark_key,
         &Value::String(watermark),
-        Duration::from_secs(WATERMARK_TTL_SECS),
+        WATERMARK_TTL_SECS,
+        now_epoch_secs,
     )?;
 
+    let mut owned = Vec::with_capacity(artists_lib.artists.len());
     for artist in &artists_lib.artists {
         let normalized_sort = strip_leading_articles(&artist.name, articles);
-        sink.upsert_contributor(&artist.name, &normalized_sort, &artist.uri)?;
+        owned.push((artist.name.as_str(), normalized_sort, artist.uri.as_str()));
     }
+    let batch: Vec<(&str, &str, &str)> = owned
+        .iter()
+        .map(|(name, sort, uri)| (*name, sort.as_str(), *uri))
+        .collect();
+    sink.upsert_contributors_batch(&batch)?;
 
     Ok(artists_lib.artists.len())
 }
@@ -188,6 +273,10 @@ pub async fn scan_enabled_playlists(
             .ephemeral_value_at(&init_key, now_epoch_secs)?
             .is_some();
 
+    let snapshot_key = format!("spotty_snapshot_ids{user_id}");
+    let cached_snapshots = cache.ephemeral_value_at(&snapshot_key, now_epoch_secs)?;
+    let snapshot_map = cached_snapshots.as_ref().and_then(Value::as_object);
+
     let mut playlist_tracks_by_id: Vec<(usize, Vec<String>)> = Vec::with_capacity(playlists.len());
     let mut track_has_image: HashMap<String, bool> = HashMap::new();
     let mut missing_uris: Vec<String> = Vec::new();
@@ -196,6 +285,16 @@ pub async fn scan_enabled_playlists(
         if playlist.id.is_empty() {
             continue;
         }
+        let cached_uris_key = format!("spotty_playlist_tracks_{}", playlist.id);
+        if is_initialized && playlist_snapshot_unchanged(playlist, snapshot_map, now_epoch_secs) {
+            if let Some(cached_uris) =
+                load_cached_playlist_uris(cache, &cached_uris_key, now_epoch_secs)?
+            {
+                playlist_tracks_by_id.push((idx, cached_uris));
+                continue;
+            }
+        }
+
         let uris = if is_initialized {
             api.playlist_track_uris(&playlist.id).await?
         } else {
@@ -210,7 +309,6 @@ pub async fn scan_enabled_playlists(
             extracted
         };
 
-        let cached_uris_key = format!("spotty_playlist_tracks_{}", playlist.id);
         let mut uri_values = Vec::with_capacity(uris.len());
         for uri in &uris {
             uri_values.push(Value::String(uri.clone()));
@@ -240,12 +338,20 @@ pub async fn scan_enabled_playlists(
         let _hydrated = api.tracks_and_episodes(&uri_refs).await?;
     }
 
-    let mut upserted_count = 0_usize;
-    for (idx, track_uris) in playlist_tracks_by_id {
-        let playlist = &playlists[idx];
-        sink.upsert_playlist(&playlist.uri, &playlist.name, &playlist.image, &track_uris)?;
-        upserted_count = upserted_count.saturating_add(1);
-    }
+    let upserted_count = playlist_tracks_by_id.len();
+    let batch: Vec<(&str, &str, &str, &[String])> = playlist_tracks_by_id
+        .iter()
+        .map(|(idx, track_uris)| {
+            let playlist = &playlists[*idx];
+            (
+                playlist.uri.as_str(),
+                playlist.name.as_str(),
+                playlist.image.as_str(),
+                track_uris.as_slice(),
+            )
+        })
+        .collect();
+    sink.upsert_playlists_batch(&batch)?;
 
     let editorial_deadline = now_epoch_secs
         .saturating_add(SPOTIFY_EDITORIAL_REFRESH_SECS)
@@ -263,7 +369,6 @@ pub async fn scan_enabled_playlists(
         snapshot_map.insert(playlist.id.clone(), Value::String(stored_value));
     }
 
-    let snapshot_key = format!("spotty_snapshot_ids{user_id}");
     cache.put_ephemeral_at(
         &snapshot_key,
         &Value::Object(snapshot_map),
@@ -279,6 +384,49 @@ pub async fn scan_enabled_playlists(
     )?;
 
     Ok(upserted_count)
+}
+
+fn playlist_snapshot_unchanged(
+    playlist: &spotty_api::NormalizedPlaylist,
+    snapshot_map: Option<&Map<String, Value>>,
+    now_epoch_secs: u64,
+) -> bool {
+    let Some(stored) = snapshot_map
+        .and_then(|map| map.get(&playlist.id))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    if stored.is_empty() {
+        return false;
+    }
+    if playlist.creator == "spotify" {
+        return stored.len() == TEN_DIGIT_SENTINEL_LEN
+            && stored.bytes().all(|b| b.is_ascii_digit())
+            && stored
+                .parse::<u64>()
+                .is_ok_and(|deadline| deadline >= now_epoch_secs);
+    }
+    stored == playlist.snapshot_id
+}
+
+fn load_cached_playlist_uris(
+    cache: &DualCache,
+    cached_uris_key: &str,
+    now_epoch_secs: u64,
+) -> Result<Option<Vec<String>>> {
+    let Some(Value::Array(items)) = cache.ephemeral_value_at(cached_uris_key, now_epoch_secs)?
+    else {
+        return Ok(None);
+    };
+    let mut uris = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(uri) = item.as_str() else {
+            return Ok(None);
+        };
+        uris.push(uri.to_owned());
+    }
+    Ok(Some(uris))
 }
 
 fn has_non_empty_image(val: &Value) -> bool {
@@ -437,6 +585,20 @@ mod tests {
         let (client, cache) = test_client(&server.uri(), &tmp, "alice");
         let mut sink = SqliteLibrarySink::open_in_memory().expect("open sqlite sink");
         sink.init_online_tracks_table().expect("init online_tracks");
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/albums"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 2,
+                "items": [{
+                    "added_at": "2026-11-18T12:00:00Z",
+                    "album": { "id": "albMissingImg" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/v1/me/albums"))
@@ -847,9 +1009,136 @@ mod tests {
             .mount(&fast_server)
             .await;
 
-        let rerun = scan_enabled_playlists(&fast_client, "alice", &cache, &mut sink, t0 + 10)
-            .await
-            .expect("fast rerun succeeds");
+        let rerun = scan_enabled_playlists(
+            &fast_client,
+            "alice",
+            &cache,
+            &mut sink,
+            t0 + SPOTIFY_EDITORIAL_REFRESH_SECS + 1,
+        )
+        .await
+        .expect("fast rerun succeeds");
         assert_eq!(rerun, 1);
+    }
+
+    #[tokio::test]
+    async fn scan_enabled_playlists_skips_unchanged_snapshot_fetches() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().expect("create tempdir");
+        let (client, cache) = test_client(&server.uri(), &tmp, "alice");
+        let mut sink = SqliteLibrarySink::open_in_memory().expect("open sqlite sink");
+        let t0 = 1_750_000_000_u64;
+
+        cache
+            .store_metadata_at(
+                "spotty_initialized_alice",
+                None,
+                &json!("1"),
+                super::MetadataWriteMode::OverwriteDirect,
+                t0,
+            )
+            .expect("seed init flag");
+        cache
+            .put_ephemeral_at(
+                "spotty_snapshot_idsalice",
+                &json!({ "plUser1": "snap-1" }),
+                super::WATERMARK_TTL_SECS,
+                t0,
+            )
+            .expect("seed snapshot");
+        cache
+            .put_ephemeral_at(
+                "spotty_playlist_tracks_plUser1",
+                &json!(["spotify:track:trk1"]),
+                super::WATERMARK_TTL_SECS,
+                t0,
+            )
+            .expect("seed cached uris");
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/playlists"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 1,
+                "next": null,
+                "items": [{
+                    "id": "plUser1",
+                    "uri": "spotify:playlist:plUser1",
+                    "name": "Unchanged Mix",
+                    "owner": {"id": "alice"},
+                    "snapshot_id": "snap-1",
+                    "images": [],
+                    "tracks": {"total": 1}
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/playlists/plUser1/tracks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let count = scan_enabled_playlists(&client, "alice", &cache, &mut sink, t0 + 10)
+            .await
+            .expect("unchanged playlist scan succeeds");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn scan_enabled_albums_persists_meta_total_in_watermark() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().expect("create tempdir");
+        let (client, cache) = test_client(&server.uri(), &tmp, "alice");
+        let mut sink = SqliteLibrarySink::open_in_memory().expect("open sqlite sink");
+        sink.init_online_tracks_table().expect("init online_tracks");
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/albums"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 42,
+                "items": [{
+                    "added_at": "2026-11-18T12:00:00Z",
+                    "album": { "id": "alb1" }
+                }]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/albums"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 1,
+                "next": null,
+                "items": []
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let t0 = 1_750_000_000_u64;
+        super::scan_enabled_albums_at(
+            &client,
+            "alice",
+            None,
+            &cache,
+            &mut sink,
+            ';',
+            TagCleanupPolicy::StripSuffixes,
+            t0,
+        )
+        .await
+        .expect("scan_enabled_albums_at succeeds");
+
+        let wm = cache
+            .ephemeral_value_at("spotty_latest_album_updatealice", t0 + 5)
+            .expect("read album watermark")
+            .expect("album watermark present");
+        assert_eq!(wm.as_str(), Some("42:2026-11-18T12:00:00Z"));
     }
 }

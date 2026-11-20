@@ -145,7 +145,7 @@ fn partition_albums(
         if album.album_type.eq_ignore_ascii_case("single") {
             singles.push(album);
         } else if album.album_type.eq_ignore_ascii_case("compilation")
-            || primary_artist_name(&album) != artist.name
+            || !primary_artist_name(&album).eq_ignore_ascii_case(&artist.name)
         {
             compilations.push(album);
         } else {
@@ -534,5 +534,26 @@ mod tests {
         // Unsaved Singles & Compilations are omitted; Top Tracks + 3 actions follow.
         assert_eq!(overview.items[1].name, "Top Tracks");
         assert_eq!(overview.items[1].items.len(), 2);
+    }
+
+    #[test]
+    fn partition_albums_matches_artist_name_case_insensitively() {
+        let mut artist = NormalizedArtist::default();
+        artist.id = String::from("a1");
+        artist.uri = String::from("spotify:artist:a1");
+        artist.name = String::from("Miles Davis");
+
+        let mut album = NormalizedAlbum::default();
+        album.id = String::from("alb1");
+        album.uri = String::from("spotify:album:alb1");
+        album.name = String::from("Kind of Blue");
+        album.artist = String::from("miles davis");
+        album.album_type = String::from("album");
+        album.release_date = String::from("1959-08-17");
+
+        let (regular, singles, compilations) = partition_albums(&artist, vec![album]);
+        assert_eq!(regular.len(), 1);
+        assert!(singles.is_empty());
+        assert!(compilations.is_empty());
     }
 }

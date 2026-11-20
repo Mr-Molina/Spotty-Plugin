@@ -73,6 +73,9 @@ where
         else {
             continue;
         };
+        if id == ROOT_PARENT {
+            continue;
+        }
         known_folders.insert(id.as_str());
         let parent_key = if parent.is_empty() {
             ROOT_PARENT
@@ -121,12 +124,24 @@ where
     }
 
     let mut visited: HashSet<&str> = HashSet::new();
+    visited.insert(ROOT_PARENT);
+    let mut all_visited: HashSet<&str> = HashSet::new();
+    all_visited.insert(ROOT_PARENT);
     let mut root_items = build_children_for(
         ROOT_PARENT,
         &folders_by_parent,
         &leaves_by_parent,
         &mut visited,
+        &mut all_visited,
     );
+    let mut orphaned_leaves: Vec<FolderTreeItem<T>> = Vec::new();
+    for (parent_id, leaves) in leaves_by_parent {
+        if !all_visited.contains(parent_id) {
+            orphaned_leaves.extend(leaves);
+        }
+    }
+    orphaned_leaves.sort_by_key(FolderTreeItem::order);
+    root_items.extend(orphaned_leaves);
     root_items.extend(unmapped_root);
     root_items
 }
@@ -136,6 +151,7 @@ fn build_children_for<'a, T: Clone>(
     folders_by_parent: &HashMap<&'a str, Vec<FolderMeta<'a>>>,
     leaves_by_parent: &HashMap<&'a str, Vec<FolderTreeItem<T>>>,
     visited: &mut HashSet<&'a str>,
+    all_visited: &mut HashSet<&'a str>,
 ) -> Vec<FolderTreeItem<T>> {
     let mut items: Vec<FolderTreeItem<T>> = Vec::new();
 
@@ -148,8 +164,14 @@ fn build_children_for<'a, T: Clone>(
             if !visited.insert(folder.id) {
                 continue;
             }
-            let children =
-                build_children_for(folder.id, folders_by_parent, leaves_by_parent, visited);
+            all_visited.insert(folder.id);
+            let children = build_children_for(
+                folder.id,
+                folders_by_parent,
+                leaves_by_parent,
+                visited,
+                all_visited,
+            );
             visited.remove(folder.id);
 
             if !children.is_empty() {
@@ -269,5 +291,84 @@ mod tests {
         let empty: Vec<TestPlaylist> = Vec::new();
         let tree = build_folder_tree(&empty, &hierarchy, |p| &p.uri);
         assert!(tree.is_empty(), "empty input should prune all folders");
+    }
+
+    #[test]
+    fn preserves_cyclic_and_orphan_playlists_and_ignores_root_folder_id() {
+        let mut hierarchy = HashMap::new();
+        hierarchy.insert(
+            String::from("/"),
+            FolderEntry::Folder {
+                id: String::from("/"),
+                name: String::from("FakeRoot"),
+                parent: String::from("/"),
+                order: 0,
+            },
+        );
+        hierarchy.insert(
+            String::from("f_a"),
+            FolderEntry::Folder {
+                id: String::from("f_a"),
+                name: String::from("Cycle A"),
+                parent: String::from("f_b"),
+                order: 1,
+            },
+        );
+        hierarchy.insert(
+            String::from("f_b"),
+            FolderEntry::Folder {
+                id: String::from("f_b"),
+                name: String::from("Cycle B"),
+                parent: String::from("f_a"),
+                order: 2,
+            },
+        );
+        hierarchy.insert(
+            String::from("f_orphan"),
+            FolderEntry::Folder {
+                id: String::from("f_orphan"),
+                name: String::from("Orphan"),
+                parent: String::from("missing_parent"),
+                order: 3,
+            },
+        );
+        hierarchy.insert(
+            String::from("spotify:playlist:1111111111111111111111"),
+            FolderEntry::Playlist {
+                uri: String::from("spotify:playlist:1111111111111111111111"),
+                parent: String::from("f_a"),
+                order: 4,
+            },
+        );
+        hierarchy.insert(
+            String::from("spotify:playlist:2222222222222222222222"),
+            FolderEntry::Playlist {
+                uri: String::from("spotify:playlist:2222222222222222222222"),
+                parent: String::from("f_orphan"),
+                order: 5,
+            },
+        );
+
+        let playlists = vec![
+            TestPlaylist {
+                uri: String::from("spotify:playlist:1111111111111111111111"),
+                title: String::from("Cyclic"),
+            },
+            TestPlaylist {
+                uri: String::from("spotify:playlist:2222222222222222222222"),
+                title: String::from("Orphaned"),
+            },
+        ];
+
+        let tree = build_folder_tree(&playlists, &hierarchy, |p| &p.uri);
+        assert_eq!(tree.len(), 2, "cyclic and orphaned playlists must remain");
+        assert!(matches!(
+            &tree[0],
+            FolderTreeItem::Leaf { item, .. } if item.title == "Cyclic"
+        ));
+        assert!(matches!(
+            &tree[1],
+            FolderTreeItem::Leaf { item, .. } if item.title == "Orphaned"
+        ));
     }
 }

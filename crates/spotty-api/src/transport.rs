@@ -2,10 +2,11 @@
 //! dual 429 rate-limit gate.
 
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use md5::Md5;
+use rand::Rng as _;
 use reqwest::{Client, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -25,6 +26,8 @@ const DEFAULT_CACHE_TTL_SECS: u64 = 60;
 const USER_ENDPOINT_TTL_SECS: u64 = 3600;
 const EDITORIAL_PLAYLIST_DEFAULT_ICON_TTL_SECS: u64 = 8 * 3600;
 const DEFAULT_RETRY_AFTER_SECS: u64 = 5;
+const MAX_RETRY_AFTER_SECS: u64 = 120;
+const MAX_SCANNER_GATE_WAITS: usize = 4;
 
 /// Policy governing how HTTP 429 rate-limit responses are handled.
 #[non_exhaustive]
@@ -62,16 +65,12 @@ impl RateLimitGate {
     }
 
     /// Returns `Some(remaining_secs)` if a cooldown window is currently active.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal cooldown mutex was poisoned by a prior panic.
     #[must_use]
     pub fn is_tripped(&self) -> Option<u64> {
         let mut guard = self
             .cooldown_until
             .lock()
-            .expect("rate limit gate mutex is never poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         let deadline = (*guard)?;
         let now = Instant::now();
         if deadline <= now {
@@ -85,20 +84,14 @@ impl RateLimitGate {
         Some(secs.max(1))
     }
 
-    /// Arms the cooldown gate for at least `secs` seconds from now.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal cooldown mutex was poisoned by a prior panic.
+    /// Arms the cooldown gate for at least `secs.max(1)` seconds from now.
     pub fn trip(&self, secs: u64) {
-        if secs == 0 {
-            return;
-        }
-        let new_deadline = Instant::now() + Duration::from_secs(secs);
+        let clamped = secs.max(1);
+        let new_deadline = Instant::now() + Duration::from_secs(clamped);
         let mut guard = self
             .cooldown_until
             .lock()
-            .expect("rate limit gate mutex is never poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         *guard = match *guard {
             Some(existing) if existing > new_deadline => Some(existing),
             _ => Some(new_deadline),
@@ -106,16 +99,24 @@ impl RateLimitGate {
     }
 
     /// Clears any active cooldown window.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal cooldown mutex was poisoned by a prior panic.
     pub fn clear(&self) {
         let mut guard = self
             .cooldown_until
             .lock()
-            .expect("rate limit gate mutex is never poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         *guard = None;
+    }
+
+    pub(crate) fn clear_if_expired(&self) {
+        let mut guard = self
+            .cooldown_until
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(deadline) = *guard {
+            if deadline <= Instant::now() {
+                *guard = None;
+            }
+        }
     }
 }
 
@@ -196,12 +197,7 @@ impl SpotifyTransport {
         client_id: IconCode,
         user_id: impl Into<String>,
     ) -> Result<Self> {
-        let http_client = Client::builder()
-            .timeout(Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS))
-            .gzip(true)
-            .use_rustls_tls()
-            .build()
-            .map_err(|err| SpottyError::Http(err.to_string()))?;
+        let http_client = tokens.http_client().clone();
 
         Ok(Self {
             http_client,
@@ -274,7 +270,10 @@ impl SpotifyTransport {
         cache_policy: CachePolicy,
     ) -> Result<TransportResponse> {
         let clean_path = path.trim_start_matches('/');
-        if let Some(remaining) = self.rate_limit_gate.is_tripped() {
+        for _ in 0..MAX_SCANNER_GATE_WAITS {
+            let Some(remaining) = self.rate_limit_gate.is_tripped() else {
+                break;
+            };
             match self.rate_limit_policy {
                 RateLimitPolicy::FailFastServer => {
                     return Err(SpottyError::RateLimited {
@@ -283,9 +282,17 @@ impl SpotifyTransport {
                     });
                 }
                 RateLimitPolicy::SleepAndRetryScanner => {
-                    tokio::time::sleep(Duration::from_secs(remaining)).await;
+                    let wait = Duration::from_secs(remaining.min(MAX_RETRY_AFTER_SECS))
+                        + jitter_duration();
+                    tokio::time::sleep(wait).await;
                 }
             }
+        }
+        if let Some(remaining) = self.rate_limit_gate.is_tripped() {
+            return Err(SpottyError::RateLimited {
+                retry_after_secs: remaining,
+                endpoint: clean_path.to_owned(),
+            });
         }
 
         let token = self
@@ -302,7 +309,7 @@ impl SpotifyTransport {
 
         let use_http_cache = method == Method::GET && cache_policy != CachePolicy::BypassCache;
         let cache_key = if use_http_cache {
-            Some(compute_http_cache_key(&relative_url, &token))
+            Some(compute_http_cache_key(&relative_url, &self.user_id))
         } else {
             None
         };
@@ -329,7 +336,7 @@ impl SpotifyTransport {
         }
 
         let full_url = format!("{}/{}", self.base_url, relative_url);
-        let outcome = self
+        let mut outcome = self
             .send_with_rate_limit_policy(
                 &method,
                 &full_url,
@@ -339,6 +346,25 @@ impl SpotifyTransport {
                 stale_entry.as_ref(),
             )
             .await?;
+
+        if outcome.status == StatusCode::UNAUTHORIZED {
+            self.tokens
+                .invalidate_access_token(&self.client_id, &self.user_id)?;
+            let refreshed = self
+                .tokens
+                .access_token_for(&self.client_id, &self.user_id)
+                .await?;
+            outcome = self
+                .send_with_rate_limit_policy(
+                    &method,
+                    &full_url,
+                    clean_path,
+                    &refreshed,
+                    body.as_deref(),
+                    stale_entry.as_ref(),
+                )
+                .await?;
+        }
 
         if outcome.status == StatusCode::NOT_MODIFIED {
             if let Some(stale) = stale_entry {
@@ -444,11 +470,16 @@ impl SpotifyTransport {
             .await?;
 
         if first.status != StatusCode::TOO_MANY_REQUESTS {
-            self.rate_limit_gate.clear();
+            if first.status.is_success() || first.status == StatusCode::NOT_MODIFIED {
+                self.rate_limit_gate.clear_if_expired();
+            }
             return Ok(first);
         }
 
-        let retry_after = first.retry_after_secs.unwrap_or(DEFAULT_RETRY_AFTER_SECS);
+        let retry_after = first
+            .retry_after_secs
+            .unwrap_or(DEFAULT_RETRY_AFTER_SECS)
+            .min(MAX_RETRY_AFTER_SECS);
         match self.rate_limit_policy {
             RateLimitPolicy::FailFastServer => {
                 warn!(
@@ -463,24 +494,31 @@ impl SpotifyTransport {
                 })
             }
             RateLimitPolicy::SleepAndRetryScanner => {
-                let wait_secs = retry_after.saturating_add(1);
+                let wait_secs = retry_after.saturating_add(1).min(MAX_RETRY_AFTER_SECS);
+                self.rate_limit_gate.trip(wait_secs);
                 debug!(
                     endpoint = %clean_path,
                     wait_secs,
                     "Scanner received 429; sleeping before single retry"
                 );
-                tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+                tokio::time::sleep(Duration::from_secs(wait_secs) + jitter_duration()).await;
                 let second = self
                     .send_once(method, full_url, token, body, stale_entry)
                     .await?;
                 if second.status == StatusCode::TOO_MANY_REQUESTS {
-                    let second_retry = second.retry_after_secs.unwrap_or(retry_after);
+                    let second_retry = second
+                        .retry_after_secs
+                        .unwrap_or(retry_after)
+                        .min(MAX_RETRY_AFTER_SECS);
+                    self.rate_limit_gate.trip(second_retry);
                     return Err(SpottyError::RateLimited {
                         retry_after_secs: second_retry,
                         endpoint: clean_path.to_owned(),
                     });
                 }
-                self.rate_limit_gate.clear();
+                if second.status.is_success() || second.status == StatusCode::NOT_MODIFIED {
+                    self.rate_limit_gate.clear_if_expired();
+                }
                 Ok(second)
             }
         }
@@ -525,8 +563,8 @@ impl SpotifyTransport {
         let etag = header_str(headers, "etag");
         let last_modified = header_str(headers, "last-modified");
         let cache_control = header_str(headers, "cache-control");
-        let retry_after_secs =
-            header_str(headers, "retry-after").and_then(|raw| raw.trim().parse::<u64>().ok());
+        let retry_after_secs = header_str(headers, "retry-after")
+            .and_then(|raw| parse_retry_after_at(&raw, current_epoch_secs()));
 
         let text = response
             .text()
@@ -590,13 +628,13 @@ fn encode_rfc3986(input: &str) -> String {
     out
 }
 
-fn compute_http_cache_key(relative_url: &str, token: &str) -> String {
+pub(crate) fn compute_http_cache_key(relative_url: &str, user_scope: &str) -> String {
     use md5::Digest as _;
 
     let mut hasher = Md5::new();
     hasher.update(relative_url.as_bytes());
     if is_user_scoped_path(relative_url) {
-        hasher.update(token.as_bytes());
+        hasher.update(user_scope.as_bytes());
     }
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(32);
@@ -612,6 +650,80 @@ fn is_user_scoped_path(relative_url: &str) -> bool {
         || path_only.starts_with("me/")
         || path_only == "browse"
         || path_only.starts_with("browse/")
+        || path_only == "playlists"
+        || path_only.starts_with("playlists/")
+}
+
+fn jitter_duration() -> Duration {
+    let ms = rand::thread_rng().gen_range(0..500);
+    Duration::from_millis(ms)
+}
+
+fn parse_retry_after_at(raw: &str, now_epoch_secs: u64) -> Option<u64> {
+    let trimmed = raw.trim();
+    if let Ok(secs) = trimmed.parse::<u64>() {
+        return Some(secs.min(MAX_RETRY_AFTER_SECS));
+    }
+    let target_epoch = parse_http_date_epoch(trimmed)?;
+    let delta = target_epoch.saturating_sub(now_epoch_secs);
+    Some(delta.min(MAX_RETRY_AFTER_SECS))
+}
+
+fn parse_http_date_epoch(raw: &str) -> Option<u64> {
+    // Supports IMF-fixdate ("Wed, 21 Oct 2015 07:28:00 GMT") and RFC 850.
+    let without_weekday = raw.split_once(',').map_or(raw, |(_, rest)| rest).trim();
+    let parts: Vec<&str> = without_weekday.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let day: u64 = parts[0].parse().ok()?;
+    let month: u64 = match parts[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts[2].parse().ok()?;
+    let mut hms = parts[3].split(':');
+    let hour: u64 = hms.next()?.parse().ok()?;
+    let min: u64 = hms.next()?.parse().ok()?;
+    let sec: u64 = hms.next()?.parse().ok()?;
+    if hms.next().is_some()
+        || year < 1970
+        || month == 0
+        || day == 0
+        || hour > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
+    let days = days_from_civil(year, month, day)?;
+    Some(days * 86_400 + hour * 3600 + min * 60 + sec)
+}
+
+fn days_from_civil(year: u64, month: u64, day: u64) -> Option<u64> {
+    let mut y = i64::try_from(year).ok()?;
+    let m = i64::try_from(month).ok()?;
+    let d = i64::try_from(day).ok()?;
+    if m <= 2 {
+        y -= 1;
+    }
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let unix_days = era * 146_097 + doe - 719_468;
+    u64::try_from(unix_days).ok()
 }
 
 fn strip_gzip_etag(etag: &str) -> String {
@@ -731,17 +843,21 @@ mod tests {
     }
 
     #[test]
-    fn cache_key_salts_me_and_browse_with_token() {
-        let me_a = compute_http_cache_key("me/albums?limit=50", "tok-a");
-        let me_b = compute_http_cache_key("me/albums?limit=50", "tok-b");
-        assert_ne!(me_a, me_b, "me* keys must be token-salted");
+    fn cache_key_salts_me_browse_and_playlists_with_user_scope() {
+        let me_a = compute_http_cache_key("me/albums?limit=50", "alice");
+        let me_b = compute_http_cache_key("me/albums?limit=50", "bob");
+        assert_ne!(me_a, me_b, "me* keys must be user-salted");
 
-        let browse_a = compute_http_cache_key("browse/categories", "tok-a");
-        let browse_b = compute_http_cache_key("browse/categories", "tok-b");
-        assert_ne!(browse_a, browse_b, "browse* keys must be token-salted");
+        let browse_a = compute_http_cache_key("browse/categories", "alice");
+        let browse_b = compute_http_cache_key("browse/categories", "bob");
+        assert_ne!(browse_a, browse_b, "browse* keys must be user-salted");
 
-        let track_a = compute_http_cache_key("tracks?ids=123", "tok-a");
-        let track_b = compute_http_cache_key("tracks?ids=123", "tok-b");
+        let pl_a = compute_http_cache_key("playlists/123/tracks?market=from_token", "alice");
+        let pl_b = compute_http_cache_key("playlists/123/tracks?market=from_token", "bob");
+        assert_ne!(pl_a, pl_b, "playlists/* keys must be user-salted");
+
+        let track_a = compute_http_cache_key("tracks?ids=123", "alice");
+        let track_b = compute_http_cache_key("tracks?ids=123", "bob");
         assert_eq!(track_a, track_b, "non-user keys must be shared");
     }
 
@@ -865,7 +981,7 @@ mod tests {
         let (transport, cache, _) =
             build_transport(&server.uri(), &tmp, RateLimitPolicy::FailFastServer);
 
-        let cache_key = compute_http_cache_key("me", "bearer-tok-1");
+        let cache_key = compute_http_cache_key("me", "alice");
         let expired_entry = CachedHttpEntry::new(
             r#"{"id":"alice","country":"US"}"#,
             Some(String::from("\"etag-v1-gzip\"")),
@@ -883,5 +999,105 @@ mod tests {
         assert!(resp.from_cache);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, r#"{"id":"alice","country":"US"}"#);
+    }
+
+    #[test]
+    fn retry_after_parses_http_date_caps_max_and_clamps_trip_zero() {
+        let now = 1_700_000_000u64;
+        assert_eq!(super::parse_retry_after_at("15", now), Some(15));
+        assert_eq!(
+            super::parse_retry_after_at("9999", now),
+            Some(super::MAX_RETRY_AFTER_SECS)
+        );
+        // 1_700_000_010 == Tue, 14 Nov 2023 22:13:30 GMT
+        assert_eq!(
+            super::parse_retry_after_at("Tue, 14 Nov 2023 22:13:30 GMT", now),
+            Some(10)
+        );
+
+        let gate = RateLimitGate::new();
+        gate.trip(0);
+        assert!(
+            gate.is_tripped().is_some(),
+            "trip(0) must arm gate for at least 1s"
+        );
+    }
+
+    #[tokio::test]
+    async fn server_500_does_not_clear_active_rate_limit_gate() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("oops"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (transport, _, gate) =
+            build_transport(&server.uri(), &tmp, RateLimitPolicy::FailFastServer);
+
+        // First call fails with 500; verify clear_if_expired does not clear an
+        // active future cooldown.
+        let outcome = transport.get("search", &[], CachePolicy::BypassCache).await;
+        assert!(outcome.is_err());
+
+        gate.trip(10);
+        gate.clear_if_expired();
+        assert!(
+            gate.is_tripped().is_some(),
+            "clear_if_expired must not clear active future cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn unauthorized_401_evicts_cached_token_and_retries_once() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "fresh-tok-2",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .and(header("Authorization", "Bearer bearer-tok-1"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("expired"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .and(header("Authorization", "Bearer fresh-tok-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "alice"})))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (transport, _, _) =
+            build_transport(&server.uri(), &tmp, RateLimitPolicy::FailFastServer);
+        transport
+            .tokens
+            .cache_tokens(
+                &transport.client_id,
+                &transport.user_id,
+                "bearer-tok-1",
+                3600,
+                Some("seed-rt"),
+            )
+            .expect("seed tokens");
+
+        let resp = transport
+            .get("me", &[], CachePolicy::BypassCache)
+            .await
+            .expect("401 should evict token and succeed on retry");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.body, r#"{"id":"alice"}"#);
     }
 }

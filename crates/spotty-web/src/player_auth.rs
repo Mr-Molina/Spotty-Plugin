@@ -70,6 +70,7 @@ pub struct PlayerAuthSupervisor<B = LibrespotDiscoveryBackend> {
     authenticator: Arc<ZeroconfAuthenticator<B>>,
     timeout: Duration,
     active: Mutex<Option<ActiveAuthTask>>,
+    teardown: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl PlayerAuthSupervisor<LibrespotDiscoveryBackend> {
@@ -96,6 +97,7 @@ impl<B: DiscoveryBackend + 'static> PlayerAuthSupervisor<B> {
             authenticator: Arc::new(ZeroconfAuthenticator::new(backend)),
             timeout: Duration::from_secs(ZEROCONF_AUTH_TIMEOUT_SECS),
             active: Mutex::new(None),
+            teardown: Mutex::new(None),
         }
     }
 
@@ -119,10 +121,9 @@ impl<B: DiscoveryBackend + 'static> PlayerAuthSupervisor<B> {
     /// Panics if the internal supervisor mutex was poisoned by a prior panic.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        let mut guard = self
-            .active
-            .lock()
-            .expect("player auth supervisor mutex is never poisoned");
+        let Ok(mut guard) = self.active.lock() else {
+            return false;
+        };
         let Some(task) = guard.as_ref() else {
             return false;
         };
@@ -164,10 +165,12 @@ impl<B: DiscoveryBackend + 'static> PlayerAuthSupervisor<B> {
             )));
         }
 
+        self.await_pending_teardown_briefly()?;
+
         let mut guard = self
             .active
             .lock()
-            .expect("player auth supervisor mutex is never poisoned");
+            .map_err(|_| SpottyError::Audio(String::from("supervisor mutex poisoned")))?;
         if let Some(existing) = guard.as_ref() {
             if !existing.join_handle.is_finished() {
                 return Ok(false);
@@ -208,43 +211,64 @@ impl<B: DiscoveryBackend + 'static> PlayerAuthSupervisor<B> {
         Ok(true)
     }
 
-    /// Cancels and aborts any running Zeroconf authentication task.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal supervisor mutex was poisoned by a prior panic.
+    /// Cancels and aborts any running Zeroconf authentication task, tracking its
+    /// `JoinHandle` so subsequent `start()` or `shutdown_and_wait()` calls do not
+    /// race with task teardown.
     pub fn shutdown(&self) {
-        let mut guard = self
-            .active
-            .lock()
-            .expect("player auth supervisor mutex is never poisoned");
-        if let Some(mut task) = guard.take() {
+        let maybe_task = self.active.lock().ok().and_then(|mut guard| guard.take());
+        if let Some(mut task) = maybe_task {
             if let Some(tx) = task.cancel_tx.take() {
                 let _ = tx.send(());
             }
             task.abort_handle.abort();
+            if let Ok(mut teardown_guard) = self.teardown.lock() {
+                *teardown_guard = Some(task.join_handle);
+            }
         }
     }
 
-    /// Cancels the running task via its oneshot signal and awaits completion.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal supervisor mutex was poisoned by a prior panic.
+    /// Cancels any running task via its oneshot signal and awaits completion,
+    /// including any task previously aborted via [`Self::shutdown`].
     pub async fn shutdown_and_wait(&self) {
-        let maybe_task = {
-            let mut guard = self
-                .active
-                .lock()
-                .expect("player auth supervisor mutex is never poisoned");
-            guard.take()
-        };
+        let maybe_task = self.active.lock().ok().and_then(|mut guard| guard.take());
         if let Some(mut task) = maybe_task {
             if let Some(tx) = task.cancel_tx.take() {
                 let _ = tx.send(());
             }
             let _ = task.join_handle.await;
         }
+        let maybe_teardown = self
+            .teardown
+            .lock()
+            .ok()
+            .and_then(|mut teardown_guard| teardown_guard.take());
+        if let Some(handle) = maybe_teardown {
+            let _ = handle.await;
+        }
+    }
+
+    fn await_pending_teardown_briefly(&self) -> Result<()> {
+        let mut teardown_guard = self
+            .teardown
+            .lock()
+            .map_err(|_| SpottyError::Audio(String::from("supervisor teardown mutex poisoned")))?;
+        let Some(handle) = teardown_guard.as_ref() else {
+            return Ok(());
+        };
+        for _ in 0..25 {
+            if handle.is_finished() {
+                *teardown_guard = None;
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if handle.is_finished() {
+            *teardown_guard = None;
+            return Ok(());
+        }
+        Err(SpottyError::Audio(String::from(
+            "previous Zeroconf authentication task is still shutting down",
+        )))
     }
 
     /// Evaluates `player-auth.html` page state: shuts down and redirects to

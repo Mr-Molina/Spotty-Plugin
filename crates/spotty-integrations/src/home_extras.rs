@@ -69,10 +69,7 @@ pub const HOME_EXTRAS: [HomeExtraDescriptor; 5] = [
 pub fn resolve_home_extra_menu(tag: &str) -> Option<&'static str> {
     let trimmed = tag.trim();
     for extra in &HOME_EXTRAS {
-        if extra.tag == trimmed || extra.id == trimmed {
-            return Some(extra.menu_param);
-        }
-        if extra.tag == "spotty" && trimmed.eq_ignore_ascii_case("SpottyExtrasspotty") {
+        if extra.tag.eq_ignore_ascii_case(trimmed) || extra.id.eq_ignore_ascii_case(trimmed) {
             return Some(extra.menu_param);
         }
     }
@@ -162,6 +159,16 @@ mod tests {
             resolve_home_extra_menu("unknown"),
             None,
             "unknown tag must return None"
+        );
+        assert_eq!(
+            resolve_home_extra_menu("  HOME "),
+            Some("home_heroes_home"),
+            "tag matching must be case-insensitive"
+        );
+        assert_eq!(
+            resolve_home_extra_menu("SpottyExtrasTopTracks"),
+            Some("home_heroes_toptracks"),
+            "id matching must be case-insensitive"
         );
     }
 }

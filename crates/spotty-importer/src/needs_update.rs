@@ -2,6 +2,7 @@
 //!
 //! Mirrors `Plugins::Spotty::Importer::needsUpdate` (`Importer.pm:323-442`).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -64,10 +65,12 @@ async fn playlists_need_update(
     let snapshot_map = cached_snapshots.as_ref().and_then(Value::as_object);
 
     let playlists = api.my_playlists(SPOTIFY_PLAYLIST_MAX_ITEMS).await?;
+    let mut live_ids = HashSet::with_capacity(playlists.len());
     for playlist in &playlists {
         if playlist.id.is_empty() {
             continue;
         }
+        live_ids.insert(playlist.id.as_str());
         let stored = snapshot_map
             .and_then(|map| map.get(&playlist.id))
             .and_then(Value::as_str);
@@ -86,6 +89,12 @@ async fn playlists_need_update(
                 }
             }
         } else if stored_id != playlist.snapshot_id {
+            return Ok(true);
+        }
+    }
+
+    if let Some(map) = snapshot_map {
+        if map.keys().any(|id| !live_ids.contains(id.as_str())) {
             return Ok(true);
         }
     }
@@ -529,5 +538,68 @@ mod tests {
         .await
         .expect("check artist drift");
         assert!(artist_drift, "artist MD5 change must trigger update");
+    }
+
+    #[tokio::test]
+    async fn deleted_or_unfollowed_playlist_triggers_update() {
+        let server = MockServer::start().await;
+        let tmp_client = TempDir::new().expect("create tempdir client");
+        let tmp_wm = TempDir::new().expect("create tempdir wm");
+        let client = test_client(&server.uri(), &tmp_client, "alice");
+        let wm_cache = DualCache::open(tmp_wm.path().join("wm.redb")).expect("open wm cache");
+
+        let t0 = 1_750_000_000_u64;
+        let artist_hash = compute_artists_md5_hash(&[artist_with_id("art1")]);
+        wm_cache
+            .put_ephemeral_at(
+                "spotty_snapshot_idsalice",
+                &json!({
+                    "plEd000000000000000001": (t0 + SPOTIFY_EDITORIAL_REFRESH_SECS).to_string(),
+                    "plUser0000000000000001": "snap-user-1",
+                    "plRemoved0000000000001": "snap-removed-1",
+                }),
+                WATERMARK_TTL_SECS,
+                t0,
+            )
+            .expect("seed snapshot map with deleted playlist");
+        wm_cache
+            .put_ephemeral_at(
+                "spotty_latest_album_updatealice",
+                &json!("5:2026-11-18T12:00:00Z"),
+                WATERMARK_TTL_SECS,
+                t0,
+            )
+            .expect("seed album watermark");
+        wm_cache
+            .put_ephemeral_at(
+                "spotty_latest_artists_updatealice",
+                &json!(format!("1:{artist_hash}")),
+                WATERMARK_TTL_SECS,
+                t0,
+            )
+            .expect("seed artist watermark");
+
+        mount_standard_endpoints(
+            &server,
+            "snap-ed-1",
+            "snap-user-1",
+            5,
+            "2026-11-18T12:00:00Z",
+            "art1",
+        )
+        .await;
+
+        let needs = online_library_needs_update(
+            &[(String::from("alice"), client)],
+            &wm_cache,
+            PlaylistSyncPolicy::IncludePlaylists,
+            t0 + 10,
+        )
+        .await
+        .expect("check deleted playlist update");
+        assert!(
+            needs,
+            "unfollowed or deleted playlist in snapshot_map must trigger update"
+        );
     }
 }

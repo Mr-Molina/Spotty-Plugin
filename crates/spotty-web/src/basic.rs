@@ -299,11 +299,15 @@ impl BasicSettingsController {
         products: &BTreeMap<String, String>,
         diagnostics: &HelperDiagnostics,
     ) -> Result<BasicSettingsSubmission> {
+        let mut parsed_deletes = Vec::with_capacity(form.delete_accounts.len());
+        for raw_id in &form.delete_accounts {
+            parsed_deletes.push(AccountId::parse(raw_id)?);
+        }
+
         let _promoted = AuthLandingController::cleanup_and_promote(accounts)?;
 
-        for raw_id in &form.delete_accounts {
-            let account_id = AccountId::parse(raw_id)?;
-            accounts.delete_account(&account_id)?;
+        for account_id in &parsed_deletes {
+            accounts.delete_account(account_id)?;
         }
 
         let mut side_effects = Vec::new();
@@ -379,6 +383,17 @@ fn apply_save_settings(
     now_epoch_secs: u64,
     side_effects: &mut Vec<SettingsSideEffect>,
 ) -> Result<()> {
+    // Validate all inputs before executing any destructive side effects.
+    let next_icon = match form.icon_code.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => IconCode::new(raw)?,
+        _ => IconCode::default(),
+    };
+    let mut validated_dont_import = Vec::with_capacity(form.dont_import_updates.len());
+    for (raw_id, dont_import) in &form.dont_import_updates {
+        let account_id = AccountId::parse(raw_id)?;
+        validated_dont_import.push((account_id, *dont_import));
+    }
+
     if form.clear_playlist_folder_cache {
         let _removed = FolderUploadManager::purge_folder_cache(
             folder_upload_dir,
@@ -388,10 +403,6 @@ fn apply_save_settings(
         side_effects.push(SettingsSideEffect::ClearedPlaylistFolders);
     }
 
-    let next_icon = match form.icon_code.as_deref().map(str::trim) {
-        Some(raw) if !raw.is_empty() => IconCode::new(raw)?,
-        _ => IconCode::default(),
-    };
     if next_icon != prefs.icon_code {
         prefs.icon_code = next_icon;
         let existing = accounts.all_credentials()?;
@@ -403,15 +414,16 @@ fn apply_save_settings(
     }
 
     if form.clear_search_history {
-        *recent_searches = RecentSearchesStore::new();
+        recent_searches.clear()?;
         side_effects.push(SettingsSideEffect::ClearedRecentSearches);
     }
 
-    for (account_id, dont_import) in &form.dont_import_updates {
-        if *dont_import {
-            prefs.dont_import_accounts.insert(account_id.clone());
+    for (account_id, dont_import) in validated_dont_import {
+        let canonical = account_id.as_str().to_owned();
+        if dont_import {
+            prefs.dont_import_accounts.insert(canonical);
         } else {
-            prefs.dont_import_accounts.remove(account_id);
+            prefs.dont_import_accounts.remove(&canonical);
         }
     }
 
@@ -504,14 +516,16 @@ fn build_view_model(
 fn rewrite_icon_code_warning(input: &str) -> String {
     let lower = input.to_ascii_lowercase();
     let needle = "iconcode";
-    let Some(pos) = lower.find(needle) else {
-        return input.to_owned();
+    let rewritten = if let Some(pos) = lower.find(needle) {
+        let mut out = String::with_capacity(input.len() + 2);
+        out.push_str(&input[..pos]);
+        out.push_str("Client ID");
+        out.push_str(&input[pos + needle.len()..]);
+        out
+    } else {
+        input.to_owned()
     };
-    let mut out = String::with_capacity(input.len() + 2);
-    out.push_str(&input[..pos]);
-    out.push_str("Client ID");
-    out.push_str(&input[pos + needle.len()..]);
-    out
+    crate::pkce_callback::escape_html(&rewritten)
 }
 
 fn is_truthy(value: &str) -> bool {
@@ -819,5 +833,72 @@ mod tests {
             actual_keys, expected_keys,
             "JSON keys must match basic.html Template Toolkit names byte-for-byte"
         );
+    }
+
+    #[test]
+    fn validation_failure_prevents_folder_purge_and_escapes_warning_html() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = AccountStore::new(dir.path());
+        let _alice = seed_account(&store, "alice");
+        seed_player_creds(&store);
+        let upload_dir = dir.path().join("playlistFolders");
+        fs::create_dir_all(&upload_dir).expect("upload dir");
+        let marker_file = upload_dir.join("keep.file");
+        fs::write(&marker_file, b"start-group").expect("upload file");
+
+        let gate = RateLimitGate::new();
+        let mut prefs = GlobalPrefs::default();
+        let mut searches = RecentSearchesStore::new();
+
+        let mut bad_params = BTreeMap::new();
+        bad_params.insert(String::from("saveSettings"), String::from("1"));
+        bad_params.insert(String::from("clearPlaylistFolderCache"), String::from("1"));
+        bad_params.insert(String::from("pref_dontimport_../bad"), String::from("1"));
+        let bad_form = BasicSettingsForm::from_params(&bad_params);
+        let err = BasicSettingsController::handle_submit(
+            &bad_form,
+            &mut prefs,
+            &store,
+            &gate,
+            &mut searches,
+            &upload_dir,
+            1_000,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &HelperDiagnostics::default(),
+        );
+        assert!(err.is_err(), "invalid AccountId must be rejected");
+        assert!(
+            marker_file.exists(),
+            "playlist folder cache must not be purged when validation fails"
+        );
+
+        let mut warn_params = BTreeMap::new();
+        warn_params.insert(String::from("forceBasicSettings"), String::from("1"));
+        warn_params.insert(
+            String::from("warning"),
+            String::from("Bad iconCode <img src=x onerror=alert(1)>"),
+        );
+        let warn_form = BasicSettingsForm::from_params(&warn_params);
+        let ok = BasicSettingsController::handle_submit(
+            &warn_form,
+            &mut prefs,
+            &store,
+            &gate,
+            &mut searches,
+            &upload_dir,
+            1_000,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &HelperDiagnostics::default(),
+        )
+        .expect("render with warning");
+        let SettingsPostOutcome::RenderBasic(vm) = ok.outcome else {
+            panic!("expected RenderBasic");
+        };
+        let warning = vm.warning.expect("warning present");
+        assert!(warning.contains("Client ID"));
+        assert!(!warning.contains('<'));
+        assert!(warning.contains("&lt;img"));
     }
 }

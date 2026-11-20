@@ -421,57 +421,8 @@ impl SpotifyClient {
 
         let total = tracks_total.max(album.total_tracks as usize);
         if total > SPOTIFY_LIMIT {
-            let min_album = album.to_min_album();
-            let tracks_path = format!("albums/{id}/tracks");
-            let track_params = [(String::from("market"), String::from("from_token"))];
-            let country = self.country.as_str();
-
-            let hydrated = self
-                .pipeline
-                .fetch_offset_parallel(
-                    &tracks_path,
-                    &track_params,
-                    SPOTIFY_LIMIT,
-                    total,
-                    CachePolicy::UseCache,
-                    |page_json| {
-                        let page_total = usize_field(page_json.get("total"));
-                        let next = page_json
-                            .get("next")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned);
-                        let raw_items = page_json
-                            .get("items")
-                            .and_then(Value::as_array)
-                            .map_or(&[][..], Vec::as_slice);
-                        let mut tracks = Vec::with_capacity(raw_items.len());
-                        for raw_track in raw_items {
-                            if raw_track.is_null() || !is_playable_item(raw_track, country) {
-                                continue;
-                            }
-                            let normalized = normalizer.normalize_track(
-                                raw_track,
-                                Some(&min_album),
-                                &self.cache,
-                                MetadataWriteMode::MergeExisting,
-                            )?;
-                            tracks.push(normalized);
-                        }
-                        Ok(OffsetPage::new(tracks, page_total, next))
-                    },
-                )
+            self.hydrate_album_remaining_tracks(&mut album, total)
                 .await?;
-            album.tracks = hydrated;
-
-            if !album.uri.is_empty() {
-                let payload = serde_json::to_value(&album)?;
-                self.cache.store_metadata(
-                    &album.uri,
-                    None,
-                    &payload,
-                    MetadataWriteMode::OverwriteDirect,
-                )?;
-            }
         } else {
             let mut playable = Vec::with_capacity(album.tracks.len());
             for track in album.tracks {
@@ -483,6 +434,80 @@ impl SpotifyClient {
         }
 
         Ok(album)
+    }
+
+    pub(crate) async fn hydrate_album_remaining_tracks(
+        &self,
+        album: &mut NormalizedAlbum,
+        total: usize,
+    ) -> Result<()> {
+        let start_offset = if album.tracks.is_empty() {
+            0
+        } else {
+            SPOTIFY_LIMIT
+        };
+        let mut playable: Vec<_> = album
+            .tracks
+            .drain(..)
+            .filter(|track| track.is_playable)
+            .collect();
+
+        if start_offset < total {
+            let min_album = album.to_min_album();
+            let tracks_path = format!("albums/{}/tracks", album.id);
+            let country = self.country.as_str();
+            let normalizer = self.normalizer();
+            let chunks: Vec<(usize, Vec<(String, String)>)> = (start_offset..total)
+                .step_by(SPOTIFY_LIMIT)
+                .map(|offset| {
+                    (
+                        offset,
+                        vec![
+                            (String::from("market"), String::from("from_token")),
+                            (String::from("offset"), offset.to_string()),
+                            (String::from("limit"), SPOTIFY_LIMIT.to_string()),
+                        ],
+                    )
+                })
+                .collect();
+
+            let remaining = self
+                .pipeline
+                .execute_indexed_chunks(&tracks_path, &chunks, CachePolicy::UseCache, |page_json| {
+                    let raw_items = page_json
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .map_or(&[][..], Vec::as_slice);
+                    let mut tracks = Vec::with_capacity(raw_items.len());
+                    for raw_track in raw_items {
+                        if raw_track.is_null() || !is_playable_item(raw_track, country) {
+                            continue;
+                        }
+                        let normalized = normalizer.normalize_track(
+                            raw_track,
+                            Some(&min_album),
+                            &self.cache,
+                            MetadataWriteMode::MergeExisting,
+                        )?;
+                        tracks.push(normalized);
+                    }
+                    Ok(tracks)
+                })
+                .await?;
+            playable.extend(remaining);
+        }
+
+        album.tracks = playable;
+        if !album.uri.is_empty() {
+            let payload = serde_json::to_value(&*album)?;
+            self.cache.store_metadata(
+                &album.uri,
+                None,
+                &payload,
+                MetadataWriteMode::OverwriteDirect,
+            )?;
+        }
+        Ok(())
     }
 
     /// Fetches multiple albums (`/v1/albums`) in 20-ID chunks.
@@ -1328,7 +1353,7 @@ mod tests {
                 "next": next_url,
                 "items": first_50
             })))
-            .expect(1)
+            .expect(0)
             .mount(&server)
             .await;
 

@@ -168,6 +168,7 @@ fn run_sweep(cache_dir: &Path, gc: &TempAudioGc, cache: Option<&DualCache>) -> R
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::fs;
 

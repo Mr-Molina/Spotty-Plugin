@@ -75,11 +75,20 @@ impl LastMixService {
     ) -> Result<Vec<LastMixCandidate>> {
         let artist_trimmed = artist.trim();
         let title_trimmed = title.trim();
-        if artist_trimmed.is_empty() && title_trimmed.is_empty() {
+        if artist_trimmed.is_empty() || title_trimmed.is_empty() {
             return Ok(Vec::new());
         }
 
-        let query = format!("artist:{artist_trimmed} track:{title_trimmed}");
+        let mut parts = Vec::with_capacity(2);
+        if !artist_trimmed.is_empty() {
+            let escaped_artist = artist_trimmed.replace('"', "\\\"");
+            parts.push(format!("artist:\"{escaped_artist}\""));
+        }
+        if !title_trimmed.is_empty() {
+            let escaped_title = title_trimmed.replace('"', "\\\"");
+            parts.push(format!("track:\"{escaped_title}\""));
+        }
+        let query = parts.join(" ");
         let results = client
             .search(
                 &query,
@@ -139,11 +148,13 @@ impl LastMixService {
             }
         }
 
-        for candidate in &candidates {
-            if candidate.artist.to_lowercase().contains(&artist_lower)
-                && candidate.title.to_lowercase().contains(&title_lower)
-            {
-                return Ok(Some(candidate.clone()));
+        if !artist_lower.is_empty() && !title_lower.is_empty() {
+            for candidate in &candidates {
+                if candidate.artist.to_lowercase().contains(&artist_lower)
+                    && candidate.title.to_lowercase().contains(&title_lower)
+                {
+                    return Ok(Some(candidate.clone()));
+                }
             }
         }
 
@@ -255,7 +266,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/search"))
             .and(query_param("type", "track"))
-            .and(query_param("q", "artist:Unknown track:Missing"))
+            .and(query_param("q", "artist:\"Unknown\" track:\"Missing\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "tracks": { "total": 0, "next": null, "items": [] }
             })))
@@ -281,7 +292,10 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/v1/search"))
             .and(query_param("type", "track"))
-            .and(query_param("q", "artist:Daft Punk track:Veridis Quo"))
+            .and(query_param(
+                "q",
+                "artist:\"Daft Punk\" track:\"Veridis Quo\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "tracks": {
                     "total": 2,

@@ -112,7 +112,9 @@ impl DstmRecommender {
                 if seed_tracks.len() >= MAX_RECOMMENDATION_SEEDS {
                     break;
                 }
-                let query = format!("{title} artist:\"{artist}\"");
+                let escaped_title = escape_search_value(&title);
+                let escaped_artist = escape_search_value(&artist);
+                let query = format!("{escaped_title} artist:\"{escaped_artist}\"");
                 let res = client
                     .search(
                         &query,
@@ -144,7 +146,8 @@ impl DstmRecommender {
                 if !seen_artist_queries.insert(artist_lower) {
                     continue;
                 }
-                let query = format!("artist:\"{artist}\"");
+                let escaped_artist = escape_search_value(&artist);
+                let query = format!("artist:\"{escaped_artist}\"");
                 let res = client
                     .search(
                         &query,
@@ -189,6 +192,10 @@ impl DstmRecommender {
     }
 }
 
+fn escape_search_value(value: &str) -> String {
+    value.replace('"', "\\\"")
+}
+
 fn extract_track_id(raw: Option<&str>) -> Option<String> {
     use std::str::FromStr as _;
 
@@ -200,11 +207,20 @@ fn extract_track_id(raw: Option<&str>) -> Option<String> {
         if uri.kind() == SpotifyEntityKind::Track {
             return Some(uri.id().to_owned());
         }
+        return None;
     }
 
     let lower = raw_str.to_ascii_lowercase();
-    let idx = lower.find("track:")?;
-    let after = raw_str.get(idx + "track:".len()..)?;
+    let prefix_len = if lower.starts_with("spotify://track:") {
+        "spotify://track:".len()
+    } else if lower.starts_with("spotify:track:") {
+        "spotify:track:".len()
+    } else if lower.starts_with("track:") {
+        "track:".len()
+    } else {
+        return None;
+    };
+    let after = raw_str.get(prefix_len..)?;
     let mut id_end = 0usize;
     for (offset, ch) in after.char_indices() {
         if !ch.is_ascii_alphanumeric() {
@@ -220,28 +236,74 @@ fn extract_track_id(raw: Option<&str>) -> Option<String> {
     }
 }
 
+fn contains_word_boundary(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    if haystack == needle {
+        return true;
+    }
+    let mut start = 0usize;
+    while let Some(rel) = haystack[start..].find(needle) {
+        let idx = start + rel;
+        let end = idx + needle.len();
+        let left_ok = haystack[..idx]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        let right_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_alphanumeric());
+        if left_ok && right_ok {
+            return true;
+        }
+        start = idx + 1;
+        if !haystack.is_char_boundary(start) {
+            while start < haystack.len() && !haystack.is_char_boundary(start) {
+                start += 1;
+            }
+        }
+    }
+    false
+}
+
+fn title_matches(track_name: &str, title_lower: &str) -> bool {
+    if title_lower.is_empty() {
+        return false;
+    }
+    let name_lower = track_name.to_lowercase();
+    if name_lower == title_lower {
+        return true;
+    }
+    if let Some(rest) = name_lower.strip_prefix(title_lower) {
+        let trimmed = rest.trim_start();
+        return trimmed.starts_with('(')
+            || trimmed.starts_with('[')
+            || trimmed.starts_with('-')
+            || trimmed.starts_with('/');
+    }
+    false
+}
+
 fn find_matching_track_id(
     tracks: &[spotty_api::NormalizedTrack],
     artist: &str,
     title: &str,
 ) -> Option<String> {
-    let title_lower = title.to_lowercase();
-    let artist_lower = artist.to_lowercase();
+    let title_lower = title.trim().to_lowercase();
+    let artist_lower = artist.trim().to_lowercase();
+    if title_lower.is_empty() || artist_lower.is_empty() {
+        return None;
+    }
 
     for track in tracks {
-        if track.id.is_empty() {
+        if track.id.is_empty() || !title_matches(&track.name, &title_lower) {
             continue;
         }
-        if !track.name.to_lowercase().starts_with(&title_lower) {
-            continue;
-        }
-        let mut artist_matched = false;
-        for track_artist in &track.artists {
-            if track_artist.name.to_lowercase().contains(&artist_lower) {
-                artist_matched = true;
-                break;
-            }
-        }
+        let artist_matched = track.artists.iter().any(|track_artist| {
+            contains_word_boundary(&track_artist.name.to_lowercase(), &artist_lower)
+        });
         if artist_matched {
             return Some(track.id.clone());
         }
@@ -253,12 +315,15 @@ fn find_matching_artist_id(
     artists: &[spotty_api::NormalizedArtist],
     artist: &str,
 ) -> Option<String> {
-    let artist_lower = artist.to_lowercase();
+    let artist_lower = artist.trim().to_lowercase();
+    if artist_lower.is_empty() {
+        return None;
+    }
     for item in artists {
         if item.id.is_empty() {
             continue;
         }
-        if item.name.to_lowercase().contains(&artist_lower) {
+        if contains_word_boundary(&item.name.to_lowercase(), &artist_lower) {
             return Some(item.id.clone());
         }
     }
@@ -360,6 +425,23 @@ mod tests {
             None,
             "local file URL must return None"
         );
+        assert_eq!(
+            extract_track_id(Some("file:///music/soundtrack:01.flac")),
+            None,
+            "local file URL containing 'track:' must return None"
+        );
+    }
+
+    #[test]
+    fn track_and_artist_matching_respects_boundaries_and_escapes_quotes() {
+        assert_eq!(
+            escape_search_value(r#"Rock "n" Roll"#),
+            r#"Rock \"n\" Roll"#
+        );
+        assert!(title_matches("One (Remastered)", "one"));
+        assert!(!title_matches("One More Time", "one"));
+        assert!(contains_word_boundary("the artist one", "artist one"));
+        assert!(!contains_word_boundary("mozart", "art"));
     }
 
     #[tokio::test]

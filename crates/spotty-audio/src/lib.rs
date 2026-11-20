@@ -13,7 +13,10 @@ pub use crate::connect::{
     materialize_oauth_credentials, BackendDiscoveryFuture, DiscoveryBackend,
     LibrespotDiscoveryBackend, ZeroconfAuthenticator, ZEROCONF_AUTH_TIMEOUT_SECS,
 };
-pub use crate::replaygain::{resolve_lms_track_gain, NormalisationMode, ServerReplayGainMode};
+pub use crate::replaygain::{
+    resolve_lms_gain, resolve_lms_track_gain, NormalisationMode, ServerReplayGainMode,
+    MAX_REPLAY_GAIN_DB, MIN_REPLAY_GAIN_DB,
+};
 pub use crate::streamer::{
     encode_s16le_samples, load_credentials_record, offset_secs_to_ms, AudioBackend,
     BackendStreamFuture, LibrespotBackend, PcmChannelSink, ResolvedStreamParams, StreamRequest,

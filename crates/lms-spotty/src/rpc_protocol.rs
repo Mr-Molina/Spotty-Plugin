@@ -232,6 +232,11 @@ pub fn write_endpoint_file(path: &Path, info: &DaemonEndpointInfo) -> Result<()>
         ))
     })?;
     fs::create_dir_all(parent)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
 
     let file_name = path
         .file_name()
@@ -241,7 +246,19 @@ pub fn write_endpoint_file(path: &Path, info: &DaemonEndpointInfo) -> Result<()>
 
     let encoded = serde_json::to_vec_pretty(info)?;
     {
-        let mut file = fs::File::create(&tmp_path)?;
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        }
         file.write_all(&encoded)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
@@ -285,6 +302,7 @@ pub fn remove_endpoint_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use tempfile::TempDir;
 
@@ -309,6 +327,22 @@ mod tests {
         );
 
         write_endpoint_file(&endpoint_path, &info).expect("endpoint write must succeed");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let dir_mode = fs::metadata(endpoint_path.parent().expect("parent"))
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            let file_mode = fs::metadata(&endpoint_path)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(file_mode, 0o600);
+        }
         let loaded = read_endpoint_file(&endpoint_path).expect("endpoint read must succeed");
         assert_eq!(loaded, info);
         assert_eq!(loaded.token.len(), 64);

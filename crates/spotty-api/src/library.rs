@@ -2,12 +2,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::sync::Arc;
 
+use futures_util::future::try_join_all;
 use md5::Md5;
 use reqwest::Method;
 use serde_json::{json, Value};
 use spotty_cache::MetadataWriteMode;
 use spotty_types::{Result, SortOrder, SpotifyEntityKind, SpottyError};
+use tokio::sync::Semaphore;
 
 use crate::catalog::{
     build_id_chunks, encode_user_segment, extract_entity_id, is_playable_item, usize_field,
@@ -282,13 +285,34 @@ impl SpotifyClient {
             .await?;
 
         if hydration == AlbumHydration::HydrateLargeAlbums {
-            for album in &mut albums {
-                if usize::try_from(album.total_tracks).unwrap_or(0) > SPOTIFY_LIMIT
-                    && album.tracks.len() < usize::try_from(album.total_tracks).unwrap_or(0)
-                    && !album.id.is_empty()
-                {
-                    let hydrated = self.album(&album.id).await?;
-                    album.tracks = hydrated.tracks;
+            let to_hydrate: Vec<(usize, NormalizedAlbum)> = albums
+                .iter()
+                .enumerate()
+                .filter(|(_, album)| {
+                    let total = usize::try_from(album.total_tracks).unwrap_or(0);
+                    total > SPOTIFY_LIMIT && album.tracks.len() < total && !album.id.is_empty()
+                })
+                .map(|(idx, album)| (idx, album.clone()))
+                .collect();
+
+            if !to_hydrate.is_empty() {
+                let sem = Arc::new(Semaphore::new(self.pipeline().max_concurrency()));
+                let futures = to_hydrate.into_iter().map(|(idx, mut album)| {
+                    let sem = Arc::clone(&sem);
+                    async move {
+                        let _permit = sem
+                            .acquire()
+                            .await
+                            .map_err(|err| SpottyError::Io(err.to_string()))?;
+                        let total = usize::try_from(album.total_tracks).unwrap_or(0);
+                        self.hydrate_album_remaining_tracks(&mut album, total)
+                            .await?;
+                        Ok::<(usize, Vec<NormalizedTrack>), SpottyError>((idx, album.tracks))
+                    }
+                });
+
+                for (idx, tracks) in try_join_all(futures).await? {
+                    albums[idx].tracks = tracks;
                 }
             }
         }
@@ -1163,5 +1187,96 @@ mod tests {
             .expect("my_albums must succeed");
         assert_eq!(albums.len(), 1);
         assert_eq!(albums[0].added_at.as_deref(), Some("2026-11-18T12:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn my_albums_hydrates_large_albums_concurrently_from_offset_50() {
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().expect("tempdir");
+        let client = build_test_client(&server.uri(), &tmp);
+
+        let make_tracks = |start: u32, end: u32| -> Vec<serde_json::Value> {
+            (start..=end)
+                .map(|idx| {
+                    json!({
+                        "id": format!("trk{idx:019}"),
+                        "uri": format!("spotify:track:trk{idx:019}"),
+                        "name": format!("Track {idx}"),
+                        "track_number": idx,
+                        "duration_ms": 1000,
+                        "is_playable": true,
+                        "artists": [{"id": "art1", "uri": "spotify:artist:art1", "name": "A"}]
+                    })
+                })
+                .collect()
+        };
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/albums"))
+            .and(query_param("limit", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 2,
+                "next": null,
+                "items": [
+                    {
+                        "added_at": "2026-11-18T12:00:00Z",
+                        "album": {
+                            "id": "alb0000000000000000001",
+                            "uri": "spotify:album:alb0000000000000000001",
+                            "name": "Large 1",
+                            "total_tracks": 60,
+                            "artists": [],
+                            "images": [],
+                            "tracks": { "total": 60, "items": make_tracks(1, 50) }
+                        }
+                    },
+                    {
+                        "added_at": "2026-11-18T12:00:00Z",
+                        "album": {
+                            "id": "alb0000000000000000002",
+                            "uri": "spotify:album:alb0000000000000000002",
+                            "name": "Large 2",
+                            "total_tracks": 55,
+                            "artists": [],
+                            "images": [],
+                            "tracks": { "total": 55, "items": make_tracks(1, 50) }
+                        }
+                    }
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        for (alb_id, count) in [
+            ("alb0000000000000000001", 60u32),
+            ("alb0000000000000000002", 55u32),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v1/albums/{alb_id}/tracks")))
+                .and(query_param("offset", "50"))
+                .and(query_param("limit", "50"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "total": count,
+                    "next": null,
+                    "items": make_tracks(51, count)
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let albums = client
+            .my_albums(
+                MetadataWriteMode::MergeExisting,
+                AlbumHydration::HydrateLargeAlbums,
+                SortOrder::NaturalOrder,
+                50,
+            )
+            .await
+            .expect("my_albums concurrent hydration must succeed");
+        assert_eq!(albums.len(), 2);
+        assert_eq!(albums[0].tracks.len(), 60);
+        assert_eq!(albums[1].tracks.len(), 55);
     }
 }
