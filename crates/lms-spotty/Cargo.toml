@@ -7,8 +7,17 @@ license.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "lms_spotty"
+path = "src/lib.rs"
+
+[[bin]]
+name = "lms-spotty"
+path = "src/main.rs"
+
 [dependencies]
 clap = { workspace = true }
+rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 spotty-api = { path = "../spotty-api" }
