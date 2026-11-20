@@ -1,9 +1,13 @@
 //! OPML feed router, menus, formatters, and search history for `Spotty-RS`.
 
+pub mod artist_view;
 pub mod formatters;
 pub mod home;
+pub mod menus;
+pub mod router;
 pub mod search_lru;
 
+pub use crate::artist_view::fetch_artist_overview;
 pub use crate::formatters::{
     format_album_list, format_artist_list, format_episodes_list, format_playlist_list,
     format_podcast_list, format_track_list, OpmlIndexBucket, OpmlItemKind, OpmlNode,
@@ -14,6 +18,15 @@ pub use crate::home::{
     IMG_COMPILATION, IMG_FOLLOW_ARTIST, IMG_GENRES, IMG_HOME, IMG_INBOX, IMG_NEWS, IMG_PLAYLIST,
     IMG_PODCAST, IMG_RADIO, IMG_SEARCH, IMG_SONG, IMG_SONGS, IMG_TOPTRACKS, IMG_TOP_TRACKS,
     IMG_TRACK, IMG_TRANSFER, IMG_WHATS_NEW,
+};
+pub use crate::menus::{
+    add_track_to_playlist_action, add_track_to_playlist_menu, album_info_menu, artist_info_menu,
+    browse_artist_menu, global_search_menu, track_info_menu, track_or_artist_radio,
+    transfer_playback_from_spotify, transfer_playback_menu, ContextMetadata, PodcastCapability,
+    RadioSeedKind,
+};
+pub use crate::router::{
+    AdvancedFeatures, OpmlFeedResponse, OpmlRoute, OpmlRouter, RouterAccount, SearchTarget,
 };
 pub use crate::search_lru::{
     RecentSearchCliItem, RecentSearchCliQuery, RecentSearchCliResponse, RecentSearchesStore,
