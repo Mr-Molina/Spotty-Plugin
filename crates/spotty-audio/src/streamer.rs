@@ -4,9 +4,11 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::future::Future;
+use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::time::Duration;
 
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
@@ -31,6 +33,7 @@ use spotty_types::SpotifyUri;
 use spotty_types::SpottyError;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt as _;
+use tokio::io::BufWriter;
 use tokio::sync::mpsc;
 
 use crate::replaygain::NormalisationMode;
@@ -46,6 +49,8 @@ pub const PCM_CHANNELS: u8 = 2;
 pub const PCM_BITS_PER_SAMPLE: u8 = 16;
 
 const PCM_CHANNEL_CAPACITY: usize = 64;
+const PCM_WRITER_BUF_BYTES: usize = 64 * 1024;
+const PCM_SINK_COALESCE_BYTES: usize = 16 * 1024;
 const CREDENTIALS_FILE: &str = "credentials.json";
 
 /// Parameters describing an individual Spotify track or episode stream request.
@@ -58,6 +63,8 @@ pub struct StreamRequest {
     pub uri: SpotifyUri,
     /// Optional start seek offset in whole seconds (`--start-position`).
     pub start_offset_secs: Option<u64>,
+    /// Optional start seek offset in milliseconds (takes precedence when set).
+    pub start_offset_ms: Option<u32>,
     /// Target Spotify Vorbis stream bitrate.
     pub bitrate: Bitrate,
     /// Whether `librespot` may persist decrypted audio chunks to disk.
@@ -66,8 +73,14 @@ pub struct StreamRequest {
     pub normalisation: NormalisationMode,
     /// Access point fallback port policy (`--ap-port=12321`).
     pub ap_fallback: ApFallbackPolicy,
+    /// Optional explicit access point port (`--ap-port=<port>`).
+    pub ap_port: Option<u16>,
     /// Device display name announced during Spotify session setup.
     pub device_name: String,
+    /// Whether `--verbose` was requested on legacy CLI.
+    pub verbose: bool,
+    /// Whether `--disable-discovery` was requested on legacy CLI.
+    pub disable_discovery: bool,
 }
 
 impl StreamRequest {
@@ -78,11 +91,15 @@ impl StreamRequest {
             cache_dir: cache_dir.into(),
             uri,
             start_offset_secs: None,
+            start_offset_ms: None,
             bitrate: Bitrate::default(),
             audio_cache: AudioCachePolicy::Disabled,
             normalisation: NormalisationMode::Disabled,
             ap_fallback: ApFallbackPolicy::default(),
+            ap_port: None,
             device_name: String::from("Squeezebox"),
+            verbose: false,
+            disable_discovery: false,
         }
     }
 }
@@ -105,6 +122,8 @@ pub struct ResolvedStreamParams {
     pub normalisation: NormalisationMode,
     /// Access point fallback port policy.
     pub ap_fallback: ApFallbackPolicy,
+    /// Optional explicit access point port override.
+    pub ap_port: Option<u16>,
     /// Device display name.
     pub device_name: String,
     /// Reusable credentials loaded from [`AccountStore`].
@@ -198,8 +217,14 @@ impl<B: AudioBackend> TrackStreamer<B> {
     where
         W: AsyncWrite + Unpin + Send,
     {
-        let start_position_ms = offset_secs_to_ms(request.start_offset_secs)?;
-        let credentials = load_credentials_record(&request.cache_dir)?;
+        let start_position_ms = match request.start_offset_ms {
+            Some(ms) => ms,
+            None => offset_secs_to_ms(request.start_offset_secs)?,
+        };
+        let cache_dir = request.cache_dir.clone();
+        let credentials = tokio::task::spawn_blocking(move || load_credentials_record(&cache_dir))
+            .await
+            .map_err(|err| SpottyError::Audio(format!("credentials load task failed: {err}")))??;
 
         let params = ResolvedStreamParams {
             cache_dir: request.cache_dir.clone(),
@@ -209,6 +234,7 @@ impl<B: AudioBackend> TrackStreamer<B> {
             audio_cache: request.audio_cache,
             normalisation: request.normalisation,
             ap_fallback: request.ap_fallback,
+            ap_port: request.ap_port,
             device_name: request.device_name.clone(),
             credentials,
         };
@@ -216,15 +242,16 @@ impl<B: AudioBackend> TrackStreamer<B> {
         let (pcm_tx, mut pcm_rx) = mpsc::channel::<Vec<u8>>(PCM_CHANNEL_CAPACITY);
         let backend_fut = self.backend.stream_to_channel(params, pcm_tx);
         let write_fut = async {
+            let mut buffered = BufWriter::with_capacity(PCM_WRITER_BUF_BYTES, writer);
             let mut total_bytes = 0u64;
             while let Some(chunk) = pcm_rx.recv().await {
                 if chunk.is_empty() {
                     continue;
                 }
-                writer.write_all(&chunk).await?;
+                buffered.write_all(&chunk).await?;
                 total_bytes = total_bytes.saturating_add(chunk.len() as u64);
             }
-            writer.flush().await?;
+            buffered.flush().await?;
             Ok::<u64, SpottyError>(total_bytes)
         };
 
@@ -347,6 +374,80 @@ fn map_librespot_bitrate(bitrate: Bitrate) -> LibrespotBitrate {
     }
 }
 
+struct PlayerSessionGuard {
+    player: Option<std::sync::Arc<Player>>,
+    session: Session,
+}
+
+impl PlayerSessionGuard {
+    fn shutdown(mut self) {
+        if let Some(player) = self.player.take() {
+            player.stop();
+            drop(player);
+        }
+        self.session.shutdown();
+    }
+}
+
+impl Drop for PlayerSessionGuard {
+    fn drop(&mut self) {
+        if let Some(player) = self.player.take() {
+            player.stop();
+            drop(player);
+        }
+        self.session.shutdown();
+    }
+}
+
+async fn drive_player_events(
+    events: &mut mpsc::UnboundedReceiver<PlayerEvent>,
+    is_session_invalid: impl Fn() -> bool,
+) -> Result<()> {
+    let mut saw_terminal_event = false;
+    let mut health_tick = tokio::time::interval(Duration::from_secs(1));
+    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            maybe_event = events.recv() => {
+                match maybe_event {
+                    Some(PlayerEvent::EndOfTrack { .. } | PlayerEvent::Stopped { .. }) => {
+                        saw_terminal_event = true;
+                        break;
+                    }
+                    Some(PlayerEvent::Unavailable { track_id, .. }) => {
+                        return Err(SpottyError::Audio(format!(
+                            "Spotify track unavailable: {track_id}"
+                        )));
+                    }
+                    Some(_) => {
+                        if is_session_invalid() {
+                            return Err(SpottyError::Audio(String::from(
+                                "Spotify AP session disconnected mid-stream",
+                            )));
+                        }
+                    }
+                    None => break,
+                }
+            }
+            _ = health_tick.tick() => {
+                if is_session_invalid() {
+                    return Err(SpottyError::Audio(String::from(
+                        "Spotify AP session disconnected mid-stream",
+                    )));
+                }
+            }
+        }
+    }
+
+    if !saw_terminal_event {
+        return Err(SpottyError::Audio(String::from(
+            "Spotify player event stream closed unexpectedly before EndOfTrack/Stopped",
+        )));
+    }
+    Ok(())
+}
+
 async fn stream_via_librespot(
     params: ResolvedStreamParams,
     pcm_tx: mpsc::Sender<Vec<u8>>,
@@ -355,24 +456,34 @@ async fn stream_via_librespot(
     let librespot_uri = librespot_core::SpotifyUri::from_uri(&params.uri.to_colon_uri())
         .map_err(|err| SpottyError::InvalidUri(err.to_string()))?;
 
+    let device_id = crate::connect::derive_device_id_salted(
+        &params.device_name,
+        &params.cache_dir.to_string_lossy(),
+    );
     let session_config = SessionConfig {
-        ap_port: match params.ap_fallback {
+        device_id,
+        ap_port: params.ap_port.or(match params.ap_fallback {
             ApFallbackPolicy::ForcePort12321 => Some(12_321),
             _ => None,
-        },
+        }),
         tmp_dir: params.cache_dir.clone(),
         ..SessionConfig::default()
     };
 
-    let audio_cache_dir =
-        (params.audio_cache == AudioCachePolicy::Enabled).then(|| params.cache_dir.join("audio"));
-    let cache = Cache::new(
-        Some(params.cache_dir.as_path()),
-        None::<&Path>,
-        audio_cache_dir.as_deref(),
-        None,
-    )
-    .map_err(|err| SpottyError::Cache(err.to_string()))?;
+    let cache_dir = params.cache_dir.clone();
+    let enable_audio_cache = params.audio_cache == AudioCachePolicy::Enabled;
+    let cache = tokio::task::spawn_blocking(move || {
+        let audio_cache_dir = enable_audio_cache.then(|| cache_dir.join("audio"));
+        Cache::new(
+            Some(cache_dir.as_path()),
+            None::<&Path>,
+            audio_cache_dir.as_deref(),
+            None,
+        )
+        .map_err(|err| SpottyError::Cache(err.to_string()))
+    })
+    .await
+    .map_err(|err| SpottyError::Audio(format!("cache init task failed: {err}")))??;
 
     let session = Session::new(session_config, Some(cache));
     session
@@ -380,50 +491,62 @@ async fn stream_via_librespot(
         .await
         .map_err(|err| SpottyError::Audio(format!("Spotify session connect failed: {err}")))?;
 
+    if session.is_invalid() {
+        session.shutdown();
+        return Err(SpottyError::Audio(String::from(
+            "Spotify session became invalid immediately after connect",
+        )));
+    }
+
     let player_config = PlayerConfig {
         bitrate: map_librespot_bitrate(params.bitrate),
         normalisation: params.normalisation == NormalisationMode::Enabled,
         ..PlayerConfig::default()
     };
 
-    let player = Player::new(player_config, session, Box::new(NoOpVolume), move || {
-        Box::new(PcmChannelSink::new(pcm_tx))
-    });
+    let player = Player::new(
+        player_config,
+        session.clone(),
+        Box::new(NoOpVolume),
+        move || Box::new(PcmChannelSink::new(pcm_tx)),
+    );
 
     let mut events = player.get_player_event_channel();
     player.load(librespot_uri, true, params.start_position_ms);
 
-    let mut outcome = Ok(());
-    while let Some(event) = events.recv().await {
-        match event {
-            PlayerEvent::EndOfTrack { .. } | PlayerEvent::Stopped { .. } => break,
-            PlayerEvent::Unavailable { track_id, .. } => {
-                outcome = Err(SpottyError::Audio(format!(
-                    "Spotify track unavailable: {track_id}"
-                )));
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    player.stop();
-    drop(player);
+    let guard = PlayerSessionGuard {
+        player: Some(player),
+        session: session.clone(),
+    };
+    let outcome = drive_player_events(&mut events, || session.is_invalid()).await;
+    guard.shutdown();
     outcome
 }
 
 /// Custom `librespot_playback` [`Sink`] forwarding decoded `44_100 Hz` 16-bit
 /// signed little-endian stereo PCM frames into a bounded `tokio` channel.
+///
+/// # Thread Contract
+///
+/// `librespot-playback` invokes [`Sink::write`] on its dedicated audio thread.
+/// If [`Sink::write`] is ever called from a Tokio runtime thread, `send_bytes`
+/// avoids panicking by trying non-blocking `try_send` first, using
+/// `tokio::task::block_in_place` on multi-threaded runtimes, and returning
+/// [`SinkError::NotConnected`] if a single-threaded runtime channel is full.
 #[derive(Debug)]
 pub struct PcmChannelSink {
     tx: Option<mpsc::Sender<Vec<u8>>>,
+    scratch: Vec<u8>,
 }
 
 impl PcmChannelSink {
     /// Creates a new [`PcmChannelSink`] targeting `tx`.
     #[must_use]
     pub fn new(tx: mpsc::Sender<Vec<u8>>) -> Self {
-        Self { tx: Some(tx) }
+        Self {
+            tx: Some(tx),
+            scratch: Vec::with_capacity(PCM_SINK_COALESCE_BYTES),
+        }
     }
 
     fn send_bytes(&self, bytes: Vec<u8>) -> SinkResult<()> {
@@ -435,8 +558,42 @@ impl PcmChannelSink {
                 "PCM sink channel already closed",
             )));
         };
-        tx.blocking_send(bytes)
-            .map_err(|err| SinkError::NotConnected(format!("PCM receiver dropped: {err}")))
+
+        match tx.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(SinkError::NotConnected(
+                String::from("PCM receiver dropped"),
+            )),
+            Err(mpsc::error::TrySendError::Full(unsent)) => {
+                match tokio::runtime::Handle::try_current() {
+                    Err(_) => tx.blocking_send(unsent).map_err(|err| {
+                        SinkError::NotConnected(format!("PCM receiver dropped: {err}"))
+                    }),
+                    Ok(handle)
+                        if handle.runtime_flavor()
+                            == tokio::runtime::RuntimeFlavor::MultiThread =>
+                    {
+                        tokio::task::block_in_place(|| tx.blocking_send(unsent)).map_err(|err| {
+                            SinkError::NotConnected(format!("PCM receiver dropped: {err}"))
+                        })
+                    }
+                    Ok(_) => Err(SinkError::NotConnected(String::from(
+                        "PCM sink channel full on single-threaded Tokio runtime",
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn flush_scratch(&mut self) -> SinkResult<()> {
+        if self.scratch.is_empty() {
+            return Ok(());
+        }
+        let chunk = mem::replace(
+            &mut self.scratch,
+            Vec::with_capacity(PCM_SINK_COALESCE_BYTES),
+        );
+        self.send_bytes(chunk)
     }
 }
 
@@ -446,18 +603,28 @@ impl Sink for PcmChannelSink {
     }
 
     fn stop(&mut self) -> SinkResult<()> {
+        let flush_res = self.flush_scratch();
         self.tx = None;
-        Ok(())
+        flush_res
     }
 
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         match packet {
             AudioPacket::Samples(samples) => {
                 let pcm_i16 = converter.f64_to_s16(&samples);
-                let bytes = encode_s16le_samples(&pcm_i16);
-                self.send_bytes(bytes)
+                self.scratch.reserve(pcm_i16.len().saturating_mul(2));
+                for sample in pcm_i16 {
+                    self.scratch.extend_from_slice(&sample.to_le_bytes());
+                }
+                if self.scratch.len() >= PCM_SINK_COALESCE_BYTES {
+                    self.flush_scratch()?;
+                }
+                Ok(())
             }
-            AudioPacket::Raw(raw) => self.send_bytes(raw),
+            AudioPacket::Raw(raw) => {
+                self.flush_scratch()?;
+                self.send_bytes(raw)
+            }
         }
     }
 }
@@ -650,5 +817,42 @@ mod tests {
             .await
             .expect_err("missing credentials must fail");
         assert_eq!(err, SpottyError::NoAccessToken);
+    }
+
+    #[tokio::test]
+    async fn pcm_channel_sink_does_not_panic_on_tokio_runtime_thread() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut sink = PcmChannelSink::new(tx);
+        let mut converter = Converter::new(None);
+        sink.start().expect("sink start");
+        sink.write(AudioPacket::Raw(vec![1, 2, 3, 4]), &mut converter)
+            .expect("first raw packet should succeed via try_send");
+        let full_err = sink
+            .write(AudioPacket::Raw(vec![5, 6, 7, 8]), &mut converter)
+            .expect_err("full channel on current_thread runtime must return Err without panicking");
+        assert!(matches!(full_err, SinkError::NotConnected(_)));
+        sink.stop().expect("sink stop");
+        assert_eq!(rx.recv().await, Some(vec![1, 2, 3, 4]));
+    }
+
+    #[tokio::test]
+    async fn drive_player_events_rejects_premature_close_and_session_disconnect() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        drop(tx);
+        let err = drive_player_events(&mut rx, || false)
+            .await
+            .expect_err("unexpected event channel closure must fail");
+        assert!(matches!(err, SpottyError::Audio(_)));
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        tx2.send(PlayerEvent::SessionConnected {
+            connection_id: String::from("conn-1"),
+            user_name: String::from("tester"),
+        })
+        .ok();
+        let err2 = drive_player_events(&mut rx2, || true)
+            .await
+            .expect_err("invalid session must fail");
+        assert!(matches!(err2, SpottyError::Audio(_)));
     }
 }

@@ -1,7 +1,9 @@
 //! Legacy `spotty` helper CLI flag parser and `--check` capability report
 //! formatter.
 
+use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -70,11 +72,6 @@ impl Default for HelperCapabilities {
 ///
 /// Line 1 is `ok spotty v{version}` and line 2+ is pretty-printed JSON of
 /// `caps`.
-///
-/// # Panics
-///
-/// Never panics under normal operation because `serde_json` serialization of
-/// [`HelperCapabilities`] boolean fields is infallible.
 #[must_use]
 pub fn format_helper_check_output(version: &str, caps: &HelperCapabilities) -> String {
     let trimmed = version.trim();
@@ -82,8 +79,7 @@ pub fn format_helper_check_output(version: &str, caps: &HelperCapabilities) -> S
         .strip_prefix('v')
         .or_else(|| trimmed.strip_prefix('V'))
         .unwrap_or(trimmed);
-    let json = serde_json::to_string_pretty(caps)
-        .expect("HelperCapabilities JSON serialization is infallible");
+    let json = serde_json::to_string_pretty(caps).unwrap_or_else(|_| String::from("{}"));
     format!("ok spotty v{clean_version}\n{json}")
 }
 
@@ -117,6 +113,30 @@ pub enum LegacySpottyCliAction {
         /// Access point port fallback policy (`--ap-port=12321`).
         ap_fallback: ApFallbackPolicy,
     },
+    /// `--authenticate --zeroconf-port=<port>` Zeroconf discovery login with
+    /// explicit HTTP listener port.
+    ZeroconfAuthenticateOnPort {
+        /// Target cache directory (`-c` / `--cache`).
+        cache_dir: PathBuf,
+        /// Announced Zeroconf device name (`-n` / `--name`).
+        device_name: String,
+        /// Access point port fallback policy (`--ap-port=...`).
+        ap_fallback: ApFallbackPolicy,
+        /// Explicit Zeroconf HTTP listener port (`--zeroconf-port`).
+        zeroconf_port: u16,
+    },
+}
+
+impl LegacySpottyCliAction {
+    /// Returns the explicit `--zeroconf-port` if this action is
+    /// [`LegacySpottyCliAction::ZeroconfAuthenticateOnPort`].
+    #[must_use]
+    pub fn zeroconf_port(&self) -> Option<u16> {
+        match self {
+            Self::ZeroconfAuthenticateOnPort { zeroconf_port, .. } => Some(*zeroconf_port),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -139,7 +159,7 @@ struct LegacySpottyArgs {
     single_track: Option<String>,
 
     #[arg(long = "start-position")]
-    start_position: Option<u64>,
+    start_position: Option<f64>,
 
     #[arg(long = "bitrate")]
     bitrate: Option<u16>,
@@ -155,6 +175,9 @@ struct LegacySpottyArgs {
 
     #[arg(long = "ap-port")]
     ap_port: Option<u16>,
+
+    #[arg(long = "zeroconf-port")]
+    zeroconf_port: Option<u16>,
 
     #[arg(long = "get-token")]
     get_token: bool,
@@ -200,11 +223,10 @@ where
         return Ok(None);
     };
 
-    let starts_with_dash = first.to_str().is_some_and(|s| s.starts_with('-'));
-    let cli_slice = if starts_with_dash {
-        &raw[..]
-    } else {
+    let cli_slice = if is_binary_argv0(first) {
         &raw[1..]
+    } else {
+        &raw[..]
     };
     if cli_slice.is_empty() {
         return Ok(None);
@@ -213,15 +235,20 @@ where
     let parsed = LegacySpottyArgs::try_parse_from(cli_slice)
         .map_err(|err| SpottyError::Audio(format!("invalid legacy spotty CLI arguments: {err}")))?;
 
-    let _ = (
-        parsed.disable_discovery,
-        parsed.scope.as_deref(),
-        parsed.verbose,
-    );
+    if parsed.verbose {
+        tracing::debug!("legacy spotty CLI invoked with --verbose");
+    }
+    if let Some(scope) = parsed.scope.as_deref() {
+        if scope.trim().is_empty() {
+            return Err(SpottyError::Audio(String::from("--scope cannot be empty")));
+        }
+        tracing::debug!(scope = %scope, "legacy spotty CLI --scope provided");
+    }
+
     let device_name = parsed
         .name
         .unwrap_or_else(|| String::from(DEFAULT_DEVICE_NAME));
-    let ap_fallback = parse_ap_fallback(parsed.ap_port)?;
+    let (ap_fallback, ap_port) = parse_ap_fallback(parsed.ap_port)?;
 
     let action_count = usize::from(parsed.check)
         + usize::from(parsed.single_track.is_some())
@@ -251,8 +278,10 @@ where
     if let Some(track_raw) = parsed.single_track {
         let uri: SpotifyUri = track_raw.parse()?;
         let bitrate = parse_bitrate(parsed.bitrate)?;
+        let (start_secs, start_ms) = parse_start_position(parsed.start_position)?;
         let mut req = StreamRequest::new(cache_dir, uri);
-        req.start_offset_secs = parsed.start_position;
+        req.start_offset_secs = start_secs;
+        req.start_offset_ms = start_ms;
         req.bitrate = bitrate;
         req.audio_cache = if parsed.disable_audio_cache {
             AudioCachePolicy::Disabled
@@ -265,7 +294,10 @@ where
             NormalisationMode::Disabled
         };
         req.ap_fallback = ap_fallback;
+        req.ap_port = ap_port;
         req.device_name = device_name;
+        req.verbose = parsed.verbose;
+        req.disable_discovery = parsed.disable_discovery;
         return Ok(Some(LegacySpottyCliAction::SingleTrackStream(req)));
     }
 
@@ -290,11 +322,59 @@ where
         }));
     }
 
+    if let Some(zeroconf_port) = parsed.zeroconf_port {
+        return Ok(Some(LegacySpottyCliAction::ZeroconfAuthenticateOnPort {
+            cache_dir,
+            device_name,
+            ap_fallback,
+            zeroconf_port,
+        }));
+    }
+
     Ok(Some(LegacySpottyCliAction::ZeroconfAuthenticate {
         cache_dir,
         device_name,
         ap_fallback,
     }))
+}
+
+fn is_binary_argv0(arg: &OsStr) -> bool {
+    let Some(s) = arg.to_str() else {
+        return false;
+    };
+    if s.starts_with('-') {
+        return false;
+    }
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+    let stem = Path::new(s)
+        .file_stem()
+        .and_then(|st| st.to_str())
+        .unwrap_or(s);
+    stem.eq_ignore_ascii_case("spotty") || stem.eq_ignore_ascii_case("lms-spotty")
+}
+
+fn parse_start_position(raw: Option<f64>) -> Result<(Option<u64>, Option<u32>)> {
+    let Some(secs) = raw else {
+        return Ok((None, None));
+    };
+    if !secs.is_finite() || secs < 0.0 {
+        return Err(SpottyError::Audio(format!(
+            "invalid --start-position {secs}; expected non-negative finite seconds"
+        )));
+    }
+    let ms_f64 = (secs * 1_000.0).round();
+    if ms_f64 > f64::from(u32::MAX) {
+        return Err(SpottyError::Audio(format!(
+            "seek offset {secs}s exceeds 32-bit millisecond limit"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole_secs = secs.trunc() as u64;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let ms = ms_f64 as u32;
+    Ok((Some(whole_secs), Some(ms)))
 }
 
 fn parse_bitrate(raw: Option<u16>) -> Result<Bitrate> {
@@ -308,13 +388,14 @@ fn parse_bitrate(raw: Option<u16>) -> Result<Bitrate> {
     }
 }
 
-fn parse_ap_fallback(ap_port: Option<u16>) -> Result<ApFallbackPolicy> {
+fn parse_ap_fallback(ap_port: Option<u16>) -> Result<(ApFallbackPolicy, Option<u16>)> {
     match ap_port {
-        None => Ok(ApFallbackPolicy::DefaultPort),
-        Some(FALLBACK_AP_PORT) => Ok(ApFallbackPolicy::ForcePort12321),
-        Some(other) => Err(SpottyError::Audio(format!(
-            "unsupported --ap-port {other}; expected {FALLBACK_AP_PORT}"
+        None => Ok((ApFallbackPolicy::DefaultPort, None)),
+        Some(0) => Err(SpottyError::Audio(String::from(
+            "invalid --ap-port 0; expected 1..=65535",
         ))),
+        Some(FALLBACK_AP_PORT) => Ok((ApFallbackPolicy::ForcePort12321, Some(FALLBACK_AP_PORT))),
+        Some(port) => Ok((ApFallbackPolicy::DefaultPort, Some(port))),
     }
 }
 
@@ -523,5 +604,60 @@ mod tests {
         let conflict = parse_legacy_spotty_args(["-c", "/tmp", "--check", "--authenticate"])
             .expect_err("conflicting actions must fail");
         assert!(matches!(conflict, SpottyError::Audio(_)));
+    }
+
+    #[test]
+    fn parses_zeroconf_port_float_start_position_general_ap_port_and_flags() {
+        let auth = parse_legacy_spotty_args([
+            "spotty",
+            "-c",
+            "/var/cache/spotty",
+            "-n",
+            "Spotty",
+            "--authenticate",
+            "--zeroconf-port",
+            "44100",
+        ])
+        .expect("zeroconf-port should parse")
+        .expect("action");
+        assert_eq!(auth.zeroconf_port(), Some(44_100));
+        assert!(matches!(
+            auth,
+            LegacySpottyCliAction::ZeroconfAuthenticateOnPort {
+                zeroconf_port: 44_100,
+                ..
+            }
+        ));
+
+        let stream = parse_legacy_spotty_args([
+            "-c",
+            "/cache",
+            "--single-track",
+            "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+            "--start-position",
+            "12.5",
+            "--ap-port",
+            "4070",
+            "--disable-discovery",
+            "--verbose",
+        ])
+        .expect("float start-position and general ap-port should parse")
+        .expect("action");
+        let LegacySpottyCliAction::SingleTrackStream(req) = stream else {
+            panic!("expected SingleTrackStream");
+        };
+        assert_eq!(req.start_offset_secs, Some(12));
+        assert_eq!(req.start_offset_ms, Some(12_500));
+        assert_eq!(req.ap_port, Some(4070));
+        assert!(req.verbose);
+        assert!(req.disable_discovery);
+
+        let bad_pos = parse_legacy_spotty_args(["unexpected-arg", "--check"])
+            .expect_err("unexpected positional arg must not be stripped as argv[0]");
+        assert!(matches!(bad_pos, SpottyError::Audio(_)));
+
+        let bad_scope = parse_legacy_spotty_args(["-c", "/tmp", "--check", "--scope", "  "])
+            .expect_err("empty --scope must fail");
+        assert!(matches!(bad_scope, SpottyError::Audio(_)));
     }
 }
