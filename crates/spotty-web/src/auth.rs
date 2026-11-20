@@ -84,7 +84,8 @@ impl AuthLandingController {
     }
 
     /// Promotes `<spotty_dir>/__AUTHENTICATE__` to its `<8-hex>` account
-    /// folder and deletes any leftover `__AUTHENTICATE__` staging directory.
+    /// folder and deletes any leftover `__AUTHENTICATE__` staging directory
+    /// only when promotion actually succeeded.
     ///
     /// # Errors
     ///
@@ -92,8 +93,10 @@ impl AuthLandingController {
     /// [`spotty_types::SpottyError::Cache`] if folder promotion or cleanup fails.
     pub fn cleanup_and_promote(accounts: &AccountStore) -> Result<Option<AccountId>> {
         let promoted = accounts.promote_authenticate_folder()?;
-        let auth_id = AccountId::parse(AUTHENTICATE_DIR)?;
-        accounts.delete_account(&auth_id)?;
+        if promoted.is_some() {
+            let auth_id = AccountId::parse(AUTHENTICATE_DIR)?;
+            accounts.delete_account(&auth_id)?;
+        }
         Ok(promoted)
     }
 
@@ -176,6 +179,24 @@ mod tests {
         assert!(
             !store.spotty_dir().join(AUTHENTICATE_DIR).exists(),
             "__AUTHENTICATE__ directory must be removed"
+        );
+    }
+
+    #[test]
+    fn cleanup_and_promote_preserves_authenticate_when_no_credentials_exist() {
+        let dir = TempDir::new().expect("temp dir should be created");
+        let store = AccountStore::new(dir.path());
+        let auth_dir = store.spotty_dir().join(AUTHENTICATE_DIR);
+        fs::create_dir_all(&auth_dir).expect("auth staging dir should be created");
+        fs::write(auth_dir.join("staging.tmp"), b"in-flight")
+            .expect("staging marker should be written");
+
+        let promoted = AuthLandingController::cleanup_and_promote(&store)
+            .expect("cleanup_and_promote should succeed");
+        assert!(promoted.is_none());
+        assert!(
+            auth_dir.exists(),
+            "__AUTHENTICATE__ directory must not be deleted when promotion returns None"
         );
     }
 

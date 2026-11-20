@@ -125,6 +125,7 @@ impl PlaylistFoldersSettingsController {
                 .then_with(|| a.filename.cmp(&b.filename))
         });
 
+        let canonical_upload = fs::canonicalize(&self.upload_dir).ok();
         let mut spotify_files = Vec::new();
         if let Some(storage_dir) = self.spotify_storage_dir.as_deref() {
             let candidates = FolderDiscovery::scan_candidate_files(
@@ -133,7 +134,11 @@ impl PlaylistFoldersSettingsController {
                 &self.cache,
             )?;
             for candidate in candidates {
-                if candidate.starts_with(&self.upload_dir) {
+                let is_inside_upload = match (&canonical_upload, fs::canonicalize(&candidate)) {
+                    (Some(canon_up), Ok(canon_cand)) => canon_cand.starts_with(canon_up),
+                    _ => candidate.starts_with(&self.upload_dir),
+                };
+                if is_inside_upload {
                     continue;
                 }
                 let Ok(meta) = fs::metadata(&candidate) else {
@@ -402,5 +407,40 @@ mod tests {
             .expect("purge_upload_cache must succeed");
         assert_eq!(purged, 1);
         assert!(!file_b.exists());
+    }
+
+    #[test]
+    fn load_view_skips_upload_dir_candidates_even_with_non_canonical_paths() {
+        let tmp = TempDir::new().expect("tempdir allocation must succeed");
+        let upload_dir = tmp.path().join("playlistFolders");
+        let storage_dir = tmp.path().join("Storage");
+        let cache = test_cache(tmp.path());
+
+        let uploaded = upload_dir.join("uploaded.file");
+        write_sized_file(
+            &uploaded,
+            512,
+            b"spotify:start-group:u1:Up\r",
+            1_700_000_100,
+        );
+        let desktop = storage_dir.join("desktop.file");
+        write_sized_file(
+            &desktop,
+            512,
+            b"spotify:start-group:d1:Desk\r",
+            1_700_000_200,
+        );
+
+        let non_canonical_upload = tmp
+            .path()
+            .join("Storage")
+            .join("..")
+            .join("playlistFolders");
+        let controller =
+            PlaylistFoldersSettingsController::new(non_canonical_upload, Some(storage_dir), cache);
+        let view = controller.load_view().expect("load_view must succeed");
+        assert_eq!(view.cache_files.len(), 1);
+        assert_eq!(view.spotify_files.len(), 1);
+        assert_eq!(view.spotify_files[0].filename, "desktop.file");
     }
 }

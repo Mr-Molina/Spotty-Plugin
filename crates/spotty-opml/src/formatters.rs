@@ -245,28 +245,32 @@ pub fn format_album_list(
     articles: &[&str],
     by_label: &str,
 ) -> OpmlNode {
-    let mut ordered: Vec<(&NormalizedAlbum, String)> = Vec::with_capacity(albums.len());
-    for album in albums {
-        let stripped = strip_leading_articles(&album.name, articles);
-        ordered.push((album, stripped));
-    }
-
-    if sort_order == SortOrder::Alphabetical {
-        ordered.sort_by(|(lhs, lhs_key), (rhs, rhs_key)| {
-            lhs_key
-                .to_lowercase()
-                .cmp(&rhs_key.to_lowercase())
-                .then_with(|| lhs.name.to_lowercase().cmp(&rhs.name.to_lowercase()))
+    let mut bucket_keys = Vec::new();
+    let ordered: Vec<&NormalizedAlbum> = if sort_order == SortOrder::Alphabetical {
+        let mut keyed: Vec<(&NormalizedAlbum, String, String, String)> =
+            Vec::with_capacity(albums.len());
+        for album in albums {
+            let stripped = strip_leading_articles(&album.name, articles);
+            let stripped_lower = stripped.to_lowercase();
+            let name_lower = album.name.to_lowercase();
+            keyed.push((album, stripped, stripped_lower, name_lower));
+        }
+        keyed.sort_by(|(_, _, l_key, l_name), (_, _, r_key, r_name)| {
+            l_key.cmp(r_key).then_with(|| l_name.cmp(r_name))
         });
-    }
+        bucket_keys.reserve(keyed.len());
+        let mut sorted = Vec::with_capacity(keyed.len());
+        for (album, stripped, _, _) in keyed {
+            bucket_keys.push(leading_bucket_label(&stripped));
+            sorted.push(album);
+        }
+        sorted
+    } else {
+        albums.iter().collect()
+    };
 
     let mut items = Vec::with_capacity(ordered.len());
-    let mut bucket_keys = Vec::with_capacity(ordered.len());
-
-    for (album, stripped) in ordered {
-        let key = leading_bucket_label(&stripped);
-        bucket_keys.push(key);
-
+    for album in ordered {
         let artists = if album.artists.is_empty() {
             album.artist.clone()
         } else {
@@ -293,7 +297,9 @@ pub fn format_album_list(
 
     let mut container = OpmlNode::new(String::new(), OpmlItemKind::Outline);
     container.items = items;
-    container.index_list = compute_index_buckets(&bucket_keys);
+    if sort_order == SortOrder::Alphabetical {
+        container.index_list = compute_index_buckets(&bucket_keys);
+    }
     container
 }
 
@@ -309,25 +315,34 @@ pub fn format_artist_list(
     articles: &[&str],
     followers_label: &str,
 ) -> OpmlNode {
-    let mut ordered: Vec<(&NormalizedArtist, String)> = Vec::with_capacity(artists.len());
-    for artist in artists {
-        let base = if artist.sortname.is_empty() {
-            artist.name.as_str()
-        } else {
-            artist.sortname.as_str()
-        };
-        let stripped = strip_leading_articles(base, articles);
-        ordered.push((artist, stripped));
-    }
-
-    if sort_order == SortOrder::Alphabetical {
-        ordered.sort_by(|(lhs, lhs_key), (rhs, rhs_key)| {
-            lhs_key
-                .to_lowercase()
-                .cmp(&rhs_key.to_lowercase())
-                .then_with(|| lhs.name.to_lowercase().cmp(&rhs.name.to_lowercase()))
+    let mut bucket_keys = Vec::new();
+    let ordered: Vec<&NormalizedArtist> = if sort_order == SortOrder::Alphabetical {
+        let mut keyed: Vec<(&NormalizedArtist, String, String, String)> =
+            Vec::with_capacity(artists.len());
+        for artist in artists {
+            let base = if artist.sortname.is_empty() {
+                artist.name.as_str()
+            } else {
+                artist.sortname.as_str()
+            };
+            let stripped = strip_leading_articles(base, articles);
+            let stripped_lower = stripped.to_lowercase();
+            let name_lower = artist.name.to_lowercase();
+            keyed.push((artist, stripped, stripped_lower, name_lower));
+        }
+        keyed.sort_by(|(_, _, l_key, l_name), (_, _, r_key, r_name)| {
+            l_key.cmp(r_key).then_with(|| l_name.cmp(r_name))
         });
-    }
+        bucket_keys.reserve(keyed.len());
+        let mut sorted = Vec::with_capacity(keyed.len());
+        for (artist, stripped, _, _) in keyed {
+            bucket_keys.push(leading_bucket_label(&stripped));
+            sorted.push(artist);
+        }
+        sorted
+    } else {
+        artists.iter().collect()
+    };
 
     let my_albums_only = match album_scope {
         AlbumScope::MyAlbumsOnly => "1",
@@ -335,12 +350,7 @@ pub fn format_artist_list(
     };
 
     let mut items = Vec::with_capacity(ordered.len());
-    let mut bucket_keys = Vec::with_capacity(ordered.len());
-
-    for (artist, stripped) in ordered {
-        let key = leading_bucket_label(&stripped);
-        bucket_keys.push(key);
-
+    for artist in ordered {
         let image = first_non_empty(&[artist.image.as_str(), IMG_ARTIST]);
         let mut passthrough = BTreeMap::new();
         passthrough.insert(String::from("uri"), artist.uri.clone());
@@ -359,7 +369,9 @@ pub fn format_artist_list(
 
     let mut container = OpmlNode::new(String::new(), OpmlItemKind::Outline);
     container.items = items;
-    container.index_list = compute_index_buckets(&bucket_keys);
+    if sort_order == SortOrder::Alphabetical {
+        container.index_list = compute_index_buckets(&bucket_keys);
+    }
     container
 }
 
