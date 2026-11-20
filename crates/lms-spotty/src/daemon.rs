@@ -25,8 +25,8 @@ use spotty_opml::{
     OpmlRoute, OpmlRouter, RecentSearchCliQuery, RecentSearchesStore, RouterAccount,
 };
 use spotty_types::{
-    ApFallbackPolicy, ClientId, GlobalPrefs, IconCode, PlayerPrefs, ReplayGainPolicy, Result,
-    SpotifyEntityKind, SpotifyUri, SpottyError,
+    ClientId, GlobalPrefs, IconCode, PlayerPrefs, ReplayGainPolicy, Result, SpotifyEntityKind,
+    SpotifyUri, SpottyError,
 };
 use spotty_web::{
     check_player_credentials, AuthLandingController, BasicSettingsController, BasicSettingsForm,
@@ -46,6 +46,18 @@ use crate::rpc_protocol::{
 
 /// Default loopback TCP bind address using an OS-assigned ephemeral port.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:0";
+
+/// Maximum allowed JSON-RPC frame size in bytes (1 MiB).
+pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+const SOCKET_READ_TIMEOUT: Duration = Duration::from_secs(30);
+const SOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+const CACHE_KEY_GLOBAL_PREFS: &str = "daemon:state:global_prefs";
+const CACHE_KEY_PLAYER_PREFS: &str = "daemon:state:player_prefs";
+const CACHE_KEY_RECENT_SEARCHES: &str = "daemon:state:recent_searches";
+const CACHE_KEY_DISABLED_FORMATS: &str = "daemon:state:disabled_formats";
+const PERSISTENT_EXPIRES_AT: u64 = u64::MAX;
 
 /// Configuration for [`SpottyDaemon`].
 #[non_exhaustive]
@@ -137,6 +149,16 @@ impl DaemonState {
             Arc::clone(&accounts),
         )?);
         let rate_limit_gate = Arc::new(RateLimitGate::new());
+        let now = current_epoch_secs();
+
+        let global_prefs: GlobalPrefs =
+            load_persisted_state(&cache, CACHE_KEY_GLOBAL_PREFS, now).unwrap_or_default();
+        let player_prefs: HashMap<String, PlayerPrefs> =
+            load_persisted_state(&cache, CACHE_KEY_PLAYER_PREFS, now).unwrap_or_default();
+        let recent_searches: RecentSearchesStore =
+            load_persisted_state(&cache, CACHE_KEY_RECENT_SEARCHES, now).unwrap_or_default();
+        let disabled_formats: Vec<String> =
+            load_persisted_state(&cache, CACHE_KEY_DISABLED_FORMATS, now).unwrap_or_default();
 
         Ok(Self {
             cache_dir: cache_dir.to_path_buf(),
@@ -144,10 +166,10 @@ impl DaemonState {
             cache,
             tokens,
             rate_limit_gate,
-            global_prefs: Mutex::new(GlobalPrefs::default()),
-            player_prefs: Mutex::new(HashMap::new()),
-            recent_searches: Mutex::new(RecentSearchesStore::new()),
-            disabled_formats: Mutex::new(Vec::new()),
+            global_prefs: Mutex::new(global_prefs),
+            player_prefs: Mutex::new(player_prefs),
+            recent_searches: Mutex::new(recent_searches),
+            disabled_formats: Mutex::new(disabled_formats),
             player_auth_supervisor: PlayerAuthSupervisor::with_librespot(),
             shutdown_tx,
             token,
@@ -155,29 +177,37 @@ impl DaemonState {
     }
 
     /// Runs a read-only closure against [`GlobalPrefs`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `global_prefs` mutex was poisoned by a prior panic.
     pub fn with_global_prefs<R>(&self, f: impl FnOnce(&GlobalPrefs) -> R) -> R {
         let guard = self
             .global_prefs
             .lock()
-            .expect("global_prefs mutex is never poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&guard)
     }
 
     /// Runs a mutable closure against [`GlobalPrefs`].
-    ///
-    /// # Panics
-    ///
-    /// Panics if the `global_prefs` mutex was poisoned by a prior panic.
     pub fn with_mut_global_prefs<R>(&self, f: impl FnOnce(&mut GlobalPrefs) -> R) -> R {
         let mut guard = self
             .global_prefs
             .lock()
-            .expect("global_prefs mutex is never poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut guard)
+    }
+
+    fn persist_global_prefs(&self, prefs: &GlobalPrefs) {
+        persist_state(&self.cache, CACHE_KEY_GLOBAL_PREFS, prefs);
+    }
+
+    fn persist_player_prefs(&self, prefs: &HashMap<String, PlayerPrefs>) {
+        persist_state(&self.cache, CACHE_KEY_PLAYER_PREFS, prefs);
+    }
+
+    fn persist_recent_searches(&self, searches: &RecentSearchesStore) {
+        persist_state(&self.cache, CACHE_KEY_RECENT_SEARCHES, searches);
+    }
+
+    fn persist_disabled_formats(&self, formats: &[String]) {
+        persist_state(&self.cache, CACHE_KEY_DISABLED_FORMATS, formats);
     }
 
     /// Returns a reference to the [`DualCache`].
@@ -316,7 +346,7 @@ impl SpottyDaemon {
     }
 
     /// Runs the accept loop until shutdown is requested via `system.shutdown`,
-    /// Ctrl-C, or [`SpottyDaemon::shutdown`].
+    /// `SIGINT`/`SIGTERM`, or [`SpottyDaemon::shutdown`].
     ///
     /// # Errors
     ///
@@ -325,13 +355,59 @@ impl SpottyDaemon {
     pub async fn serve(mut self) -> Result<()> {
         let mut active_tasks = tokio::task::JoinSet::new();
 
+        #[cfg(unix)]
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        #[cfg(unix)]
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+
         loop {
+            #[cfg(unix)]
             tokio::select! {
                 biased;
                 changed = self.shutdown_rx.changed() => {
                     if changed.is_err() || *self.shutdown_rx.borrow() {
                         break;
                     }
+                }
+                _ = sigterm.recv() => {
+                    info!("Received SIGTERM, shutting down SpottyDaemon");
+                    break;
+                }
+                _ = sigint.recv() => {
+                    info!("Received SIGINT, shutting down SpottyDaemon");
+                    break;
+                }
+                accept_res = self.listener.accept() => {
+                    match accept_res {
+                        Ok((stream, peer)) => {
+                            debug!(peer = %peer, "Accepted JSON-RPC client connection");
+                            let conn_state = Arc::clone(&self.state);
+                            active_tasks.spawn(async move {
+                                if let Err(err) = handle_connection(stream, conn_state).await {
+                                    warn!(peer = %peer, error = %err, "Client connection error");
+                                }
+                            });
+                        }
+                        Err(err) => {
+                            warn!(error = %err, "TCP accept error");
+                        }
+                    }
+                }
+                Some(_) = active_tasks.join_next(), if !active_tasks.is_empty() => {}
+            }
+
+            #[cfg(not(unix))]
+            tokio::select! {
+                biased;
+                changed = self.shutdown_rx.changed() => {
+                    if changed.is_err() || *self.shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received Ctrl-C, shutting down SpottyDaemon");
+                    break;
                 }
                 accept_res = self.listener.accept() => {
                     match accept_res {
@@ -363,12 +439,39 @@ impl SpottyDaemon {
 }
 
 async fn handle_connection(stream: TcpStream, state: Arc<DaemonState>) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::io::{AsyncWriteExt as _, BufReader};
 
     let (read_half, mut write_half) = stream.into_split();
-    let mut lines = BufReader::new(read_half).lines();
+    let mut reader = BufReader::new(read_half);
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        let line = match tokio::time::timeout(
+            SOCKET_READ_TIMEOUT,
+            read_bounded_line(&mut reader, MAX_FRAME_BYTES),
+        )
+        .await
+        {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => break,
+            Ok(Err(err)) => {
+                let response =
+                    JsonRpcResponse::error(Value::Null, ERR_INVALID_REQUEST, err.to_string(), None);
+                let mut encoded = serde_json::to_vec(&response)?;
+                encoded.push(b'\n');
+                let _ = tokio::time::timeout(SOCKET_WRITE_TIMEOUT, async {
+                    write_half.write_all(&encoded).await?;
+                    write_half.flush().await
+                })
+                .await;
+                break;
+            }
+            Err(_) => {
+                return Err(SpottyError::Io(String::from(
+                    "JSON-RPC socket read timeout",
+                )));
+            }
+        };
+
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -383,11 +486,59 @@ async fn handle_connection(stream: TcpStream, state: Arc<DaemonState>) -> Result
 
         let mut encoded = serde_json::to_vec(&response)?;
         encoded.push(b'\n');
-        write_half.write_all(&encoded).await?;
-        write_half.flush().await?;
+        tokio::time::timeout(SOCKET_WRITE_TIMEOUT, async {
+            write_half.write_all(&encoded).await?;
+            write_half.flush().await
+        })
+        .await
+        .map_err(|_| SpottyError::Io(String::from("JSON-RPC socket write timeout")))??;
     }
 
     Ok(())
+}
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<String>> {
+    use tokio::io::AsyncBufReadExt as _;
+
+    let mut buf = Vec::new();
+    loop {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            let to_take = newline_pos + 1;
+            if buf.len().saturating_add(to_take) > max_bytes {
+                reader.consume(to_take);
+                return Err(SpottyError::Io(format!(
+                    "JSON-RPC frame exceeds maximum size of {max_bytes} bytes"
+                )));
+            }
+            buf.extend_from_slice(&available[..to_take]);
+            reader.consume(to_take);
+            break;
+        }
+        if buf.len().saturating_add(available.len()) > max_bytes {
+            let avail_len = available.len();
+            reader.consume(avail_len);
+            return Err(SpottyError::Io(format!(
+                "JSON-RPC frame exceeds maximum size of {max_bytes} bytes"
+            )));
+        }
+        buf.extend_from_slice(available);
+        let avail_len = available.len();
+        reader.consume(avail_len);
+    }
+
+    let line = String::from_utf8(buf)
+        .map_err(|err| SpottyError::Io(format!("Invalid UTF-8 in JSON-RPC frame: {err}")))?;
+    Ok(Some(line))
 }
 
 async fn process_request(req: JsonRpcRequest, state: &DaemonState) -> JsonRpcResponse {
@@ -497,12 +648,13 @@ fn handle_plugin_init(
         prefs.migrate_v3_ap_fallback();
         prefs.clone()
     });
+    state.persist_global_prefs(&updated_prefs);
 
     let updated_disabled = {
         let mut guard = state
             .disabled_formats
             .lock()
-            .expect("disabled_formats mutex is never poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !parsed.disabled_formats.is_empty() {
             *guard = parsed.disabled_formats;
         }
@@ -519,9 +671,14 @@ fn handle_plugin_init(
         GlobalPrefs::migrate_v1_disabled_formats(arch, os, &mut guard);
         guard.clone()
     };
+    state.persist_disabled_formats(&updated_disabled);
 
     let helper_token = parsed.helper_bin.as_deref().unwrap_or("lms-spotty");
-    let custom_convert_conf = TranscodeTableBuilder::build_custom_convert_conf(helper_token);
+    let custom_convert_conf = TranscodeTableBuilder::build_custom_convert_conf(helper_token)
+        .replace(
+            "--bitrate 320",
+            &format!("--bitrate {}", updated_prefs.bitrate.kbps()),
+        );
     let credentials = state.accounts.all_credentials()?;
     let accounts: Vec<Value> = credentials
         .into_iter()
@@ -563,7 +720,7 @@ async fn handle_opml_feed(
     let searches = state
         .recent_searches
         .lock()
-        .expect("recent_searches mutex is never poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
 
     let router = OpmlRouter::new(client, global_prefs, player_prefs)
@@ -606,7 +763,7 @@ fn handle_recent_searches(
     let mut store = state
         .recent_searches
         .lock()
-        .expect("recent_searches mutex is never poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let delete_label = parsed.delete_label.as_deref().unwrap_or("Delete");
     let clear_label = parsed.clear_label.as_deref().unwrap_or("Clear all");
@@ -617,6 +774,7 @@ fn handle_recent_searches(
                 RpcDispatchError::InvalidParams(String::from("Missing query for add"))
             })?;
             store.add(query);
+            state.persist_recent_searches(&store);
             let items: Vec<String> = store.mru_items().into_iter().map(str::to_owned).collect();
             Ok(json!({ "items": items, "count": store.len() }))
         }
@@ -629,6 +787,7 @@ fn handle_recent_searches(
                 delete_label,
                 clear_label,
             )?;
+            state.persist_recent_searches(&store);
             Ok(serde_json::to_value(resp)?)
         }
         "clear" => {
@@ -637,6 +796,7 @@ fn handle_recent_searches(
                 delete_label,
                 clear_label,
             )?;
+            state.persist_recent_searches(&store);
             Ok(serde_json::to_value(resp)?)
         }
         _ => {
@@ -767,7 +927,7 @@ fn handle_track_gain(
             state
                 .player_prefs
                 .lock()
-                .expect("player_prefs mutex is never poisoned")
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(pid)
                 .map(|prefs| prefs.replaygain)
         })
@@ -959,11 +1119,11 @@ fn handle_settings_basic(
     let mut prefs_guard = state
         .global_prefs
         .lock()
-        .expect("global_prefs mutex is never poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut searches_guard = state
         .recent_searches
         .lock()
-        .expect("recent_searches mutex is never poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let submission = BasicSettingsController::handle_submit(
         &form,
@@ -977,6 +1137,8 @@ fn handle_settings_basic(
         &parsed.products,
         &diagnostics,
     )?;
+    state.persist_global_prefs(&prefs_guard);
+    state.persist_recent_searches(&searches_guard);
 
     let outcome_json = match &submission.outcome {
         SettingsPostOutcome::RenderBasic(vm) => json!({
@@ -1114,25 +1276,26 @@ async fn handle_settings_player(
         let mut prefs = state
             .player_prefs
             .lock()
-            .expect("player_prefs mutex is never poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&player_id)
             .cloned()
             .unwrap_or_default();
         let vm = controller
             .save_prefs(&client, &mut prefs, &parsed.params)
             .await?;
-        state
+        let mut map_guard = state
             .player_prefs
             .lock()
-            .expect("player_prefs mutex is never poisoned")
-            .insert(player_id, prefs);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map_guard.insert(player_id, prefs);
+        state.persist_player_prefs(&map_guard);
         return Ok(serde_json::to_value(vm)?);
     }
 
     let prefs = state
         .player_prefs
         .lock()
-        .expect("player_prefs mutex is never poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&player_id)
         .cloned()
         .unwrap_or_default();
@@ -1182,7 +1345,7 @@ fn handle_settings_player_auth_check(
                 Some(raw) => raw,
                 None => state.with_global_prefs(|prefs| prefs.icon_code.as_str().to_owned()),
             };
-            let ap_fallback = ApFallbackPolicy::default();
+            let ap_fallback = state.with_global_prefs(|prefs| prefs.ap_fallback);
             let started = state.player_auth_supervisor.start(
                 state.accounts.spotty_dir(),
                 device_name,
@@ -1238,8 +1401,109 @@ fn parse_optional_params<T: serde::de::DeserializeOwned + Default>(
     Ok(serde_json::from_value(params)?)
 }
 
+fn load_persisted_state<T: serde::de::DeserializeOwned>(
+    cache: &DualCache,
+    key: &str,
+    now_epoch_secs: u64,
+) -> Option<T> {
+    match cache.metadata_value_at(key, now_epoch_secs) {
+        Ok(Some(val)) => match serde_json::from_value(val) {
+            Ok(parsed) => Some(parsed),
+            Err(err) => {
+                warn!(key = key, error = %err, "Failed to deserialize persisted daemon state");
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(err) => {
+            warn!(key = key, error = %err, "Failed to load persisted daemon state");
+            None
+        }
+    }
+}
+
+fn persist_state<T: serde::Serialize + ?Sized>(cache: &DualCache, key: &str, value: &T) {
+    match serde_json::to_value(value) {
+        Ok(encoded) => {
+            if let Err(err) = cache
+                .store()
+                .put_metadata(key, &encoded, PERSISTENT_EXPIRES_AT)
+            {
+                warn!(key = key, error = %err, "Failed to persist daemon state");
+            }
+        }
+        Err(err) => {
+            warn!(key = key, error = %err, "Failed to serialize daemon state");
+        }
+    }
+}
+
 fn current_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |dur| dur.as_secs())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use tempfile::TempDir;
+
+    use super::*;
+
+    #[test]
+    fn daemon_state_persists_prefs_searches_and_disabled_formats() {
+        let temp = TempDir::new().expect("tempdir must succeed");
+        let (tx1, _rx1) = watch::channel(false);
+        {
+            let state = DaemonState::initialize(temp.path(), String::from("tok"), tx1)
+                .expect("init must succeed");
+            state.with_mut_global_prefs(|prefs| {
+                prefs.country = String::from("DE");
+                state.persist_global_prefs(prefs);
+            });
+            state.persist_disabled_formats(&[String::from("ogg")]);
+            let mut searches = RecentSearchesStore::new();
+            searches.add("miles davis");
+            state.persist_recent_searches(&searches);
+            let mut pmap = HashMap::new();
+            pmap.insert(String::from("aa:bb:cc:dd:ee:ff"), PlayerPrefs::default());
+            state.persist_player_prefs(&pmap);
+        }
+
+        let (tx2, _rx2) = watch::channel(false);
+        let reloaded = DaemonState::initialize(temp.path(), String::from("tok"), tx2)
+            .expect("reinit must succeed");
+        assert_eq!(reloaded.with_global_prefs(|p| p.country.clone()), "DE");
+        assert_eq!(
+            *reloaded
+                .disabled_formats
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            vec![String::from("ogg")]
+        );
+        assert_eq!(
+            reloaded
+                .recent_searches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .mru_items(),
+            vec!["miles davis"]
+        );
+        assert!(reloaded
+            .player_prefs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key("aa:bb:cc:dd:ee:ff"));
+    }
+
+    #[tokio::test]
+    async fn bounded_line_reader_rejects_oversized_frame() {
+        let oversized = vec![b'a'; MAX_FRAME_BYTES + 16];
+        let mut cursor = std::io::Cursor::new(oversized);
+        let err = read_bounded_line(&mut cursor, MAX_FRAME_BYTES)
+            .await
+            .expect_err("oversized frame must error");
+        assert!(err.to_string().contains("exceeds maximum size"));
+    }
 }
