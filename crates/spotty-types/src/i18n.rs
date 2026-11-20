@@ -56,12 +56,16 @@ impl StringCatalog {
                 continue;
             }
 
-            if trimmed.chars().any(char::is_whitespace) {
+            let token_part = match trimmed.split_once('#') {
+                Some((before, _)) => before.trim_end(),
+                None => trimmed,
+            };
+            if token_part.is_empty() || token_part.chars().any(char::is_whitespace) {
                 continue;
             }
 
-            entries.entry(trimmed.to_owned()).or_default();
-            current_token = Some(trimmed.to_owned());
+            entries.entry(token_part.to_owned()).or_default();
+            current_token = Some(token_part.to_owned());
         }
 
         Self { entries }
@@ -78,9 +82,8 @@ impl StringCatalog {
             return token;
         };
 
-        let normalized_lang = lang.to_ascii_uppercase();
-        if let Some(localized) = translations.get(&normalized_lang) {
-            return localized.as_str();
+        if let Some(localized) = lookup_lang(translations, lang) {
+            return localized;
         }
 
         if let Some(fallback) = translations.get(FALLBACK_LANG) {
@@ -109,16 +112,51 @@ impl StringCatalog {
     }
 }
 
-/// Converts literal `\n` escape sequences in LMS string values to newlines.
-fn unescape_newlines(raw: &str) -> String {
-    if raw.contains("\\n") {
-        raw.replace("\\n", "\n")
-    } else {
-        raw.to_owned()
+fn lookup_lang<'a>(translations: &'a HashMap<String, String>, lang: &str) -> Option<&'a str> {
+    if !lang.bytes().any(|b| b.is_ascii_lowercase()) {
+        return translations.get(lang).map(String::as_str);
     }
+    if lang.len() <= 16 {
+        let mut buf = [0_u8; 16];
+        for (dst, src) in buf.iter_mut().zip(lang.bytes()) {
+            *dst = src.to_ascii_uppercase();
+        }
+        if let Ok(upper) = std::str::from_utf8(&buf[..lang.len()]) {
+            return translations.get(upper).map(String::as_str);
+        }
+    }
+    let upper = lang.to_ascii_uppercase();
+    translations.get(&upper).map(String::as_str)
+}
+
+/// Converts literal `\n` escape sequences in LMS string values to newlines,
+/// preserving escaped `\\n` as literal `\n`.
+fn unescape_newlines(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -194,6 +232,24 @@ PLUGIN_AFTER_ORPHAN
             "orphan translation before any token should not create an entry"
         );
         assert_eq!(catalog.text("PLUGIN_AFTER_ORPHAN", "en"), "Valid text");
+    }
+
+    #[test]
+    fn handles_escaped_backslashes_and_inline_token_comments() {
+        let input = "\
+PLUGIN_INLINE_COMMENT\t# trailing comment
+\tEN\tPath\\\\nLiteral\\nNextLine
+";
+        let catalog = StringCatalog::parse_strings_txt(input);
+        assert!(catalog.has_token("PLUGIN_INLINE_COMMENT"));
+        assert_eq!(
+            catalog.text("PLUGIN_INLINE_COMMENT", "en"),
+            "Path\\nLiteral\nNextLine"
+        );
+        assert_eq!(
+            catalog.text("PLUGIN_INLINE_COMMENT", "EN"),
+            "Path\\nLiteral\nNextLine"
+        );
     }
 
     #[test]

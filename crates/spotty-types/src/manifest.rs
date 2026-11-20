@@ -147,29 +147,68 @@ fn require_tag<'a>(xml: &'a str, tag: &str) -> Result<&'a str> {
     Ok(trimmed)
 }
 
+fn find_open_tag(xml: &str, tag: &str) -> Option<(usize, usize, bool)> {
+    let prefix = format!("<{tag}");
+    let mut offset = 0;
+    while let Some(rel) = xml.get(offset..)?.find(&prefix) {
+        let start_idx = offset + rel;
+        let after_name = start_idx + prefix.len();
+        let next_byte = xml.as_bytes().get(after_name).copied()?;
+        if next_byte == b'>' {
+            return Some((start_idx, after_name + 1, false));
+        }
+        if next_byte.is_ascii_whitespace() {
+            let mut quote: Option<u8> = None;
+            let bytes = xml.as_bytes();
+            let mut idx = after_name;
+            while idx < bytes.len() {
+                let b = bytes[idx];
+                if let Some(q) = quote {
+                    if b == q {
+                        quote = None;
+                    }
+                } else if b == b'"' || b == b'\'' {
+                    quote = Some(b);
+                } else if b == b'>' {
+                    let self_closing = idx > after_name && bytes[idx - 1] == b'/';
+                    return Some((start_idx, idx + 1, self_closing));
+                }
+                idx += 1;
+            }
+            return None;
+        }
+        offset = after_name;
+    }
+    None
+}
+
 fn extract_tag_inner<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{tag}>");
+    let (_start_idx, content_start, self_closing) = find_open_tag(xml, tag)?;
+    if self_closing {
+        return Some("");
+    }
     let close = format!("</{tag}>");
-    let start_idx = xml.find(&open)?;
-    let content_start = start_idx + open.len();
     let rest = xml.get(content_start..)?;
     let end_rel = rest.find(&close)?;
     rest.get(..end_rel)
 }
 
 fn remove_element_block(xml: &str, tag: &str) -> String {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let Some(start_idx) = xml.find(&open) else {
+    let Some((start_idx, content_start, self_closing)) = find_open_tag(xml, tag) else {
         return xml.to_owned();
     };
-    let Some(rest) = xml.get(start_idx..) else {
-        return xml.to_owned();
+    let end_idx = if self_closing {
+        content_start
+    } else {
+        let close = format!("</{tag}>");
+        let Some(rest) = xml.get(content_start..) else {
+            return xml.to_owned();
+        };
+        let Some(end_rel) = rest.find(&close) else {
+            return xml.to_owned();
+        };
+        content_start + end_rel + close.len()
     };
-    let Some(end_rel) = rest.find(&close) else {
-        return xml.to_owned();
-    };
-    let end_idx = start_idx + end_rel + close.len();
     let mut out = String::with_capacity(xml.len());
     if let Some(before) = xml.get(..start_idx) {
         out.push_str(before);
@@ -188,9 +227,15 @@ fn strip_xml_comments(xml: &str) -> String {
             out.push_str(before);
         }
         let Some(after_open) = cursor.get(start + 4..) else {
+            if let Some(tail) = cursor.get(start..) {
+                out.push_str(tail);
+            }
             return out;
         };
         let Some(end) = after_open.find("-->") else {
+            if let Some(tail) = cursor.get(start..) {
+                out.push_str(tail);
+            }
             return out;
         };
         cursor = after_open.get(end + 3..).unwrap_or("");
@@ -211,6 +256,7 @@ fn extract_icon_hash(icon_path: &str) -> Result<&str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use proptest::{prop_assert, prop_assert_eq, proptest};
 
@@ -265,6 +311,42 @@ mod tests {
             <icon>a/not-hex.png</icon>\
             <targetApplication><minVersion>7.7</minVersion></targetApplication></extension>";
         assert!(PluginManifest::from_install_xml(bad_icon).is_err());
+    }
+
+    #[test]
+    fn parses_xml_with_tag_attributes_and_unclosed_comment() {
+        let xml = r#"
+<extension name="Spotty">
+  <id scope="lms">21cbb80e-67b8-44a8-a662-21c6c7ae5260</id>
+  <version build="1">4.62.3</version>
+  <optionsURL kind="html">plugins/Spotty/settings/basic.html</optionsURL>
+  <icon type="png">HTML/EN/plugins/Spotty/html/images/93aac68fb06348598c1e67734dfaceee.png</icon>
+  <targetApplication min="true">
+    <minVersion operator="ge">7.7</minVersion>
+  </targetApplication>
+  <!-- unclosed comment at end
+</extension>
+"#;
+        let manifest =
+            PluginManifest::from_install_xml(xml).expect("XML with attributes should parse");
+        assert_eq!(manifest.id, "21cbb80e-67b8-44a8-a662-21c6c7ae5260");
+        assert_eq!(manifest.version, "4.62.3");
+        assert_eq!(manifest.min_lms_version, "7.7");
+        assert_eq!(manifest.options_url, "plugins/Spotty/settings/basic.html");
+        assert_eq!(manifest.icon_code.as_str(), DEFAULT_ICON_HASH);
+
+        let unclosed_before = "\
+<extension>\
+  <!-- unclosed comment does not drop rest \
+  <id>21cbb80e-67b8-44a8-a662-21c6c7ae5260</id>\
+  <version>4.62.3</version>\
+  <optionsURL>plugins/Spotty/settings/basic.html</optionsURL>\
+  <icon>93aac68fb06348598c1e67734dfaceee.png</icon>\
+  <targetApplication><minVersion>7.7</minVersion></targetApplication>\
+</extension>";
+        let parsed = PluginManifest::from_install_xml(unclosed_before)
+            .expect("unclosed comment must not truncate remaining XML");
+        assert_eq!(parsed.id, "21cbb80e-67b8-44a8-a662-21c6c7ae5260");
     }
 
     proptest! {

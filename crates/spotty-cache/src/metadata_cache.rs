@@ -3,6 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use redb::ReadableTable as _;
 use serde_json::Value;
 use spotty_types::{Result, SpottyError};
 
@@ -215,52 +216,25 @@ impl DualCache {
         }
 
         let expires_at = now_epoch_secs.saturating_add(METADATA_TTL_SECS);
-        let written_primary =
-            self.write_single_metadata(uri, data, mode, now_epoch_secs, expires_at)?;
+        let linked = linked_from_uri.filter(|alt| !alt.is_empty() && *alt != uri);
 
-        if let Some(linked_uri) = linked_from_uri.filter(|alt| !alt.is_empty() && *alt != uri) {
-            let _written = self.write_single_metadata(
-                linked_uri,
-                &written_primary,
-                mode,
-                now_epoch_secs,
-                expires_at,
-            )?;
-        }
+        self.store.with_metadata_write_txn(|table| {
+            let written_primary =
+                write_metadata_in_txn(table, uri, data, mode, now_epoch_secs, expires_at)?;
 
-        Ok(())
-    }
+            if let Some(linked_uri) = linked {
+                let _written = write_metadata_in_txn(
+                    table,
+                    linked_uri,
+                    &written_primary,
+                    mode,
+                    now_epoch_secs,
+                    expires_at,
+                )?;
+            }
 
-    fn write_single_metadata(
-        &self,
-        key: &str,
-        data: &Value,
-        mode: MetadataWriteMode,
-        now_epoch_secs: u64,
-        expires_at: u64,
-    ) -> Result<Value> {
-        match mode {
-            MetadataWriteMode::FastSkipIfPresent => {
-                if let Some(existing) = self.store.metadata_at(key, now_epoch_secs)? {
-                    return Ok(existing);
-                }
-                self.store.put_metadata(key, data, expires_at)?;
-                Ok(data.clone())
-            }
-            MetadataWriteMode::MergeExisting => {
-                let merged = if let Some(existing) = self.store.metadata_at(key, now_epoch_secs)? {
-                    merge_no_duplicates(&existing, data)
-                } else {
-                    data.clone()
-                };
-                self.store.put_metadata(key, &merged, expires_at)?;
-                Ok(merged)
-            }
-            MetadataWriteMode::OverwriteDirect => {
-                self.store.put_metadata(key, data, expires_at)?;
-                Ok(data.clone())
-            }
-        }
+            Ok(())
+        })
     }
 
     /// Prunes expired entries across both tables using the system clock.
@@ -282,7 +256,69 @@ impl DualCache {
     }
 }
 
+fn read_unexpired_from_table(
+    table: &redb::Table<'_, &str, &str>,
+    key: &str,
+    now_epoch_secs: u64,
+) -> Result<Option<Value>> {
+    let raw = table
+        .get(key)
+        .map_err(RedbStore::map_err)?
+        .map(|guard| guard.value().to_owned());
+    let Some(json_str) = raw else {
+        return Ok(None);
+    };
+    let (value, expires_at) = RedbStore::decode_metadata_envelope(&json_str)?;
+    if now_epoch_secs >= expires_at {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+fn write_metadata_in_txn(
+    table: &mut redb::Table<'_, &str, &str>,
+    key: &str,
+    data: &Value,
+    mode: MetadataWriteMode,
+    now_epoch_secs: u64,
+    expires_at: u64,
+) -> Result<Value> {
+    match mode {
+        MetadataWriteMode::FastSkipIfPresent => {
+            if let Some(existing) = read_unexpired_from_table(table, key, now_epoch_secs)? {
+                return Ok(existing);
+            }
+            let payload = RedbStore::encode_metadata_envelope(data, expires_at)?;
+            table
+                .insert(key, payload.as_str())
+                .map_err(RedbStore::map_err)?;
+            Ok(data.clone())
+        }
+        MetadataWriteMode::MergeExisting => {
+            let merged =
+                if let Some(existing) = read_unexpired_from_table(table, key, now_epoch_secs)? {
+                    merge_no_duplicates(&existing, data)
+                } else {
+                    data.clone()
+                };
+            let payload = RedbStore::encode_metadata_envelope(&merged, expires_at)?;
+            table
+                .insert(key, payload.as_str())
+                .map_err(RedbStore::map_err)?;
+            Ok(merged)
+        }
+        MetadataWriteMode::OverwriteDirect => {
+            let payload = RedbStore::encode_metadata_envelope(data, expires_at)?;
+            table
+                .insert(key, payload.as_str())
+                .map_err(RedbStore::map_err)?;
+            Ok(data.clone())
+        }
+    }
+}
+
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use serde_json::json;
     use tempfile::TempDir;
@@ -475,5 +511,51 @@ mod tests {
             .expect("stale lookup")
             .expect("stale entry retained");
         assert_eq!(stale.etag.as_deref(), Some("W/\"abc123\""));
+    }
+
+    #[test]
+    fn concurrent_merge_existing_updates_do_not_lose_fields() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmp = TempDir::new().expect("tempdir creation must succeed");
+        let cache =
+            Arc::new(DualCache::open(tmp.path().join("concurrent.redb")).expect("open cache"));
+        let t0 = 1_700_000_000_u64;
+
+        let threads: Vec<_> = (0..6)
+            .map(|idx| {
+                let c = Arc::clone(&cache);
+                thread::spawn(move || {
+                    let field = format!("field_{idx}");
+                    c.store_metadata_at(
+                        "spotify:track:concurrent",
+                        Some("spotify:track:alias"),
+                        &json!({ field: idx }),
+                        MetadataWriteMode::MergeExisting,
+                        t0 + idx as u64,
+                    )
+                    .expect("concurrent merge must succeed");
+                })
+            })
+            .collect();
+
+        for handle in threads {
+            handle.join().expect("thread must not panic");
+        }
+
+        let canonical = cache
+            .metadata_value_at("spotify:track:concurrent", t0 + 10)
+            .expect("read canonical")
+            .expect("canonical present");
+        let alias = cache
+            .metadata_value_at("spotify:track:alias", t0 + 10)
+            .expect("read alias")
+            .expect("alias present");
+        for idx in 0..6 {
+            let field = format!("field_{idx}");
+            assert_eq!(canonical[&field], idx);
+            assert_eq!(alias[&field], idx);
+        }
     }
 }

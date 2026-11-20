@@ -236,6 +236,7 @@ fn is_x86_arch(arch: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use proptest::strategy::Just;
     use proptest::{prop_assert_eq, prop_oneof, proptest};

@@ -154,7 +154,7 @@ impl FromStr for SpotifyUri {
 
 fn parse_spotify_scheme(after_scheme: &str, original: &str) -> Result<SpotifyUri> {
     // Strip protocol handler slashes (`spotify://track:<id>` -> `track:<id>`).
-    let cleaned = after_scheme.replace('/', "");
+    let cleaned = after_scheme.strip_prefix("//").unwrap_or(after_scheme);
     let parts: Vec<&str> = cleaned.split(':').collect();
     match parts.as_slice() {
         [kind_raw, id_raw] => {
@@ -192,6 +192,17 @@ fn parse_open_spotify_path(after_host: &str, original: &str) -> Result<SpotifyUr
         }
         ["user", user_id, playlist_kw, playlist_id]
             if playlist_kw.eq_ignore_ascii_case("playlist") =>
+        {
+            if !is_valid_user_id(user_id) {
+                return Err(SpottyError::InvalidUri(format!(
+                    "invalid Spotify user id in URL: {original}"
+                )));
+            }
+            (*playlist_kw, *playlist_id)
+        }
+        [locale_seg, "user", user_id, playlist_kw, playlist_id]
+            if starts_with_ascii_ci(locale_seg, "intl-")
+                && playlist_kw.eq_ignore_ascii_case("playlist") =>
         {
             if !is_valid_user_id(user_id) {
                 return Err(SpottyError::InvalidUri(format!(
@@ -245,6 +256,7 @@ fn is_valid_entity_id(kind: SpotifyEntityKind, id: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use proptest::arbitrary::any;
     use proptest::strategy::{Just, Strategy};
@@ -314,6 +326,13 @@ mod tests {
                 .expect("legacy web user playlist URL should parse");
         assert_eq!(web_user_playlist.kind(), SpotifyEntityKind::Playlist);
         assert_eq!(web_user_playlist.id(), "37i9dQZEVXbLRQDuF5jeBp");
+
+        let intl_user_playlist: SpotifyUri =
+            "https://open.spotify.com/intl-de/user/spotifycharts/playlist/37i9dQZEVXbLRQDuF5jeBp"
+                .parse()
+                .expect("intl web user playlist URL should parse");
+        assert_eq!(intl_user_playlist.kind(), SpotifyEntityKind::Playlist);
+        assert_eq!(intl_user_playlist.id(), "37i9dQZEVXbLRQDuF5jeBp");
     }
 
     #[test]
@@ -324,6 +343,7 @@ mod tests {
             "spotify:unknown:123456",
             "spotify:track:",
             "spotify:track:bad!id",
+            "spotify:track:4uLU6hMCjMI75M1A2tKUQC/extra",
             "spotify:user::playlist:123",
             "https://example.com/track/4uLU6hMCjMI75M1A2tKUQC",
             "https://open.spotify.com/fr/album/3xN9KNcFz7zgjfNu6mQD6M",

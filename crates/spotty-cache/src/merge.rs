@@ -3,12 +3,12 @@
 //! Replaces the legacy Perl `Hash::Merge` `NO_DUPLICATES` behavior and
 //! `API::Cache` tag/artwork normalization utilities.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-const TAG_KEYWORDS: [&str; 5] = ["deluxe", "edition", "remaster", "live", "anniversary"];
+const NON_BOUNDARY_KEYWORDS: [&str; 4] = ["deluxe", "edition", "remaster", "anniversary"];
 
 /// Artwork image descriptor returned by Spotify Web API metadata payloads.
 #[non_exhaustive]
@@ -59,16 +59,22 @@ pub fn merge_no_duplicates(existing: &Value, incoming: &Value) -> Value {
         }
         (Value::Array(left), Value::Array(right)) => {
             let mut out = Vec::with_capacity(left.len().saturating_add(right.len()));
-            let mut seen_uris = HashSet::new();
-            push_deduped_items(left, &mut out, &mut seen_uris);
-            push_deduped_items(right, &mut out, &mut seen_uris);
+            let mut seen_uris = HashMap::new();
+            let mut seen_urls = HashMap::new();
+            push_deduped_items(left, &mut out, &mut seen_uris, &mut seen_urls);
+            push_deduped_items(right, &mut out, &mut seen_uris, &mut seen_urls);
             Value::Array(out)
         }
         _ => incoming.clone(),
     }
 }
 
-fn push_deduped_items(items: &[Value], out: &mut Vec<Value>, seen_uris: &mut HashSet<String>) {
+fn push_deduped_items(
+    items: &[Value],
+    out: &mut Vec<Value>,
+    seen_uris: &mut HashMap<String, usize>,
+    seen_urls: &mut HashMap<String, usize>,
+) {
     for item in items {
         let maybe_uri = item
             .as_object()
@@ -77,7 +83,36 @@ fn push_deduped_items(items: &[Value], out: &mut Vec<Value>, seen_uris: &mut Has
             .filter(|uri| !uri.is_empty());
 
         if let Some(uri) = maybe_uri {
-            if seen_uris.insert(uri.to_owned()) {
+            if let Some(&idx) = seen_uris.get(uri) {
+                out[idx] = merge_no_duplicates(&out[idx], item);
+            } else {
+                seen_uris.insert(uri.to_owned(), out.len());
+                out.push(item.clone());
+            }
+            continue;
+        }
+
+        let maybe_url = item
+            .as_object()
+            .and_then(|obj| obj.get("url"))
+            .and_then(Value::as_str)
+            .filter(|url| !url.is_empty());
+
+        if let Some(url) = maybe_url {
+            if let Some(&idx) = seen_urls.get(url) {
+                out[idx] = merge_no_duplicates(&out[idx], item);
+            } else {
+                seen_urls.insert(url.to_owned(), out.len());
+                out.push(item.clone());
+            }
+            continue;
+        }
+
+        if matches!(
+            item,
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+        ) {
+            if !out.contains(item) {
                 out.push(item.clone());
             }
         } else {
@@ -100,12 +135,49 @@ pub fn cleanup_tags(text: &str) -> String {
 
 fn contains_tag_keyword(segment: &str) -> bool {
     let lower = segment.to_ascii_lowercase();
-    for keyword in TAG_KEYWORDS {
+    for keyword in NON_BOUNDARY_KEYWORDS {
         if lower.contains(keyword) {
             return true;
         }
     }
+    contains_whole_word(&lower, "live")
+}
+
+fn contains_whole_word(haystack_lower: &str, word: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = haystack_lower[start..].find(word) {
+        let idx = start + rel;
+        let end = idx + word.len();
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + 1;
+    }
     false
+}
+
+fn find_matching_bracket(text: &str, open_idx: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let open = bytes[open_idx];
+    let close = if open == b'(' { b')' } else { b']' };
+    let mut depth = 0_usize;
+    let mut i = open_idx;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == open {
+            depth += 1;
+        } else if b == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 fn strip_keyword_brackets(text: &str) -> String {
@@ -116,8 +188,7 @@ fn strip_keyword_brackets(text: &str) -> String {
     while idx < text.len() {
         let ch_byte = bytes[idx];
         if ch_byte == b'(' || ch_byte == b'[' {
-            if let Some(rel_end) = text[idx + 1..].find([')', ']']) {
-                let close_idx = idx + 1 + rel_end;
+            if let Some(close_idx) = find_matching_bracket(text, idx) {
                 let inner = &text[idx + 1..close_idx];
                 if contains_tag_keyword(inner) {
                     idx = close_idx + 1;
@@ -171,6 +242,7 @@ pub fn largest_artwork_url(images: &[ArtworkImage]) -> &str {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::collections::HashSet;
 
@@ -234,10 +306,49 @@ mod tests {
             "expected 5 tracks after URI dedup: {tracks:?}"
         );
         assert_eq!(tracks[0]["uri"], "spotify:track:a");
-        assert_eq!(tracks[1]["name"], "Beta");
+        assert_eq!(tracks[1]["name"], "Beta Dup");
         assert_eq!(tracks[2]["name"], "NoUriFirst");
         assert_eq!(tracks[3]["uri"], "spotify:track:c");
         assert_eq!(tracks[4]["name"], "NoUriSecond");
+    }
+
+    #[test]
+    fn merge_deduplicates_primitives_urls_and_merges_matching_uri_fields() {
+        let existing = json!({
+            "genres": ["rock", "indie"],
+            "available_markets": ["US", "CA"],
+            "images": [{"url": "https://img/640", "height": 640}],
+            "tracks": [{"uri": "spotify:track:1", "name": "Old", "added_at": "2026-01-01"}]
+        });
+        let incoming = json!({
+            "genres": ["indie", "alt"],
+            "available_markets": ["CA", "GB"],
+            "images": [
+                {"url": "https://img/640", "width": 640},
+                {"url": "https://img/300", "height": 300}
+            ],
+            "tracks": [{"uri": "spotify:track:1", "name": "New", "popularity": 90}]
+        });
+
+        let merged = merge_no_duplicates(&existing, &incoming);
+        assert_eq!(merged["genres"], json!(["rock", "indie", "alt"]));
+        assert_eq!(merged["available_markets"], json!(["US", "CA", "GB"]));
+        assert_eq!(
+            merged["images"],
+            json!([
+                {"url": "https://img/640", "height": 640, "width": 640},
+                {"url": "https://img/300", "height": 300}
+            ])
+        );
+        assert_eq!(
+            merged["tracks"],
+            json!([{
+                "uri": "spotify:track:1",
+                "name": "New",
+                "added_at": "2026-01-01",
+                "popularity": 90
+            }])
+        );
     }
 
     #[test]
@@ -257,6 +368,11 @@ mod tests {
             ),
             ("Song - Part 1 - 2020 Remastered", "Song - Part 1"),
             ("  Peter Gabriel (1)  ", "Peter Gabriel (1)"),
+            ("Oliver (Alive)", "Oliver (Alive)"),
+            ("Deliver - Live at Wembley", "Deliver"),
+            ("Track (Live (2020))", "Track"),
+            ("Track [Part 1 [2020 Remaster]]", "Track"),
+            ("Track (Part 1) (2020 Remaster)", "Track (Part 1)"),
         ];
 
         for (input, expected) in cases {

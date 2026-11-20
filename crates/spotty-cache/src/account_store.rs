@@ -7,7 +7,7 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -24,6 +24,7 @@ pub const AUTHENTICATE_DIR: &str = "__AUTHENTICATE__";
 
 const CREDENTIALS_FILE: &str = "credentials.json";
 const PLAYLIST_FOLDERS_DIR: &str = "playlistFolders";
+const MAX_CREDENTIAL_BACKUPS: usize = 3;
 
 /// Short 8-character lowercase hex identifier derived from a Spotify username.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -96,7 +97,7 @@ impl FromStr for AccountId {
 
 /// Deserialized `librespot` `credentials.json` payload.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CredentialsRecord {
     /// Canonical Spotify username stored by `librespot`.
@@ -105,6 +106,16 @@ pub struct CredentialsRecord {
     pub auth_type: Option<u32>,
     /// Reusable authentication payload encoded as a string.
     pub auth_data: Option<String>,
+}
+
+impl fmt::Debug for CredentialsRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CredentialsRecord")
+            .field("username", &self.username)
+            .field("auth_type", &self.auth_type)
+            .field("auth_data", &self.auth_data.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 impl CredentialsRecord {
@@ -135,11 +146,17 @@ pub enum PurgeScope {
     FullInit,
 }
 
+#[derive(Debug, Default)]
+struct AccountCacheState {
+    generation: u64,
+    accounts: Option<Vec<(String, AccountId)>>,
+}
+
 /// Manages Spotify account folders and credentials under `<cache>/spotty`.
 #[derive(Debug)]
 pub struct AccountStore {
     spotty_dir: PathBuf,
-    cached_accounts: Mutex<Option<Vec<(String, AccountId)>>>,
+    cached_accounts: Mutex<AccountCacheState>,
 }
 
 impl AccountStore {
@@ -148,7 +165,7 @@ impl AccountStore {
     pub fn new(base_cache_dir: impl AsRef<Path>) -> Self {
         Self {
             spotty_dir: base_cache_dir.as_ref().join("spotty"),
-            cached_accounts: Mutex::new(None),
+            cached_accounts: Mutex::new(AccountCacheState::default()),
         }
     }
 
@@ -165,19 +182,18 @@ impl AccountStore {
     }
 
     /// Executes `f` with a read-only view of the in-memory cached account list.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal account cache mutex was poisoned by a prior panic.
     pub fn with_cached_accounts<R>(
         &self,
         f: impl FnOnce(Option<&[(String, AccountId)]>) -> R,
     ) -> R {
-        let guard = self
-            .cached_accounts
-            .lock()
-            .expect("account cache mutex is never poisoned");
-        f(guard.as_deref())
+        let snapshot = {
+            let guard = self
+                .cached_accounts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            guard.accounts.clone()
+        };
+        f(snapshot.as_deref())
     }
 
     /// Lists 8-hex account folders and [`AUTHENTICATE_DIR`] that contain
@@ -241,10 +257,24 @@ impl AccountStore {
 
         let target_id = AccountId::from_username(&record.username);
         let target_dir = self.account_dir(&target_id);
-        if target_dir.exists() {
-            fs::remove_dir_all(&target_dir)?;
+        let backup_dir = if target_dir.exists() {
+            let candidate = self.next_promote_backup_dir(&target_id);
+            fs::rename(&target_dir, &candidate)?;
+            Some(candidate)
+        } else {
+            None
+        };
+
+        if let Err(err) = fs::rename(&auth_dir, &target_dir) {
+            if let Some(ref backup) = backup_dir {
+                let _ = fs::rename(backup, &target_dir);
+            }
+            return Err(err.into());
         }
-        fs::rename(&auth_dir, &target_dir)?;
+
+        if let Some(backup) = backup_dir {
+            let _ = fs::remove_dir_all(&backup);
+        }
         self.invalidate_cache();
         Ok(Some(target_id))
     }
@@ -279,12 +309,16 @@ impl AccountStore {
             path = %creds_path.display(),
             "corrupted credentials.json discovered; backing up and removing folder"
         );
+        restrict_dir_perms(&self.spotty_dir);
         let backup_path = self.next_backup_path();
         if let Err(err) = fs::rename(&creds_path, &backup_path) {
             // Fall back to copy when rename fails across mount boundaries.
-            fs::copy(&creds_path, &backup_path)?;
+            copy_with_restrictive_perms(&creds_path, &backup_path)?;
             warn!(error = %err, "rename failed during backup; used copy fallback");
+        } else {
+            restrict_file_perms(&backup_path);
         }
+        self.prune_credential_backups(Some(MAX_CREDENTIAL_BACKUPS));
         if folder.exists() {
             fs::remove_dir_all(&folder)?;
         }
@@ -300,14 +334,17 @@ impl AccountStore {
     /// # Errors
     ///
     /// Returns [`SpottyError::Io`] if reading the cache directory fails.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the internal account cache mutex was poisoned by a prior panic.
     pub fn all_credentials(&self) -> Result<Vec<(String, AccountId)>> {
-        if let Some(cached) = self.with_cached_accounts(|opt| opt.map(<[_]>::to_vec)) {
-            return Ok(cached);
-        }
+        let gen_before = {
+            let guard = self
+                .cached_accounts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(ref cached) = guard.accounts {
+                return Ok(cached.clone());
+            }
+            guard.generation
+        };
 
         let folders = self.cache_folders()?;
         let mut by_username: HashMap<String, AccountId> = HashMap::new();
@@ -334,12 +371,12 @@ impl AccountStore {
                 .then_with(|| a.0.cmp(&b.0))
         });
 
-        if !accounts.is_empty() {
-            let mut guard = self
-                .cached_accounts
-                .lock()
-                .expect("account cache mutex is never poisoned");
-            *guard = Some(accounts.clone());
+        let mut guard = self
+            .cached_accounts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.generation == gen_before {
+            guard.accounts = Some(accounts.clone());
         }
         Ok(accounts)
     }
@@ -382,20 +419,19 @@ impl AccountStore {
         }
     }
 
-    /// Deletes the account folder for `id` and purges stale folders.
+    /// Deletes only the account folder for `id`.
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Io`] if removing the credentials or directory fails.
+    /// Returns [`SpottyError::Io`] if removing the directory fails.
     pub fn delete_account(&self, id: &AccountId) -> Result<()> {
-        let creds_path = self.account_dir(id).join(CREDENTIALS_FILE);
-        match fs::remove_file(&creds_path) {
+        let dir = self.account_dir(id);
+        match fs::remove_dir_all(&dir) {
             Ok(()) => {}
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => return Err(SpottyError::Io(err.to_string())),
         }
         self.invalidate_cache();
-        let _removed = self.purge_cache(PurgeScope::PreservePlayerMacs)?;
         Ok(())
     }
 
@@ -441,6 +477,8 @@ impl AccountStore {
             removed += 1;
         }
 
+        self.prune_credential_backups(None);
+
         if removed > 0 {
             self.invalidate_cache();
         }
@@ -451,8 +489,57 @@ impl AccountStore {
         let mut guard = self
             .cached_accounts
             .lock()
-            .expect("account cache mutex is never poisoned");
-        *guard = None;
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.accounts = None;
+    }
+
+    fn next_promote_backup_dir(&self, target_id: &AccountId) -> PathBuf {
+        let unix_ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let primary = self
+            .spotty_dir
+            .join(format!(".{}.bak-{unix_ts}", target_id.as_str()));
+        if !primary.exists() {
+            return primary;
+        }
+        let mut suffix = 1_u32;
+        loop {
+            let candidate = self
+                .spotty_dir
+                .join(format!(".{}.bak-{unix_ts}-{suffix}", target_id.as_str()));
+            if !candidate.exists() {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn prune_credential_backups(&self, keep_max: Option<usize>) {
+        let Ok(entries) = fs::read_dir(&self.spotty_dir) else {
+            return;
+        };
+        let mut backups: Vec<PathBuf> = entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_file()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("credentials-") && n.ends_with(".json"))
+            })
+            .collect();
+
+        let keep = keep_max.unwrap_or(0);
+        if backups.len() <= keep {
+            return;
+        }
+        backups.sort();
+        let remove_count = backups.len().saturating_sub(keep);
+        for path in backups.into_iter().take(remove_count) {
+            let _ = fs::remove_file(path);
+        }
     }
 
     fn next_backup_path(&self) -> PathBuf {
@@ -478,6 +565,46 @@ impl AccountStore {
 
 fn is_hex_len(value: &str, expected_len: usize) -> bool {
     value.len() == expected_len && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn copy_with_restrictive_perms(src: &Path, dst: &Path) -> io::Result<()> {
+    let mut reader = fs::File::open(src)?;
+    #[cfg(unix)]
+    let mut writer = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dst)?
+    };
+    #[cfg(not(unix))]
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dst)?;
+    io::copy(&mut reader, &mut writer)?;
+    Ok(())
+}
+
+fn restrict_file_perms(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+fn restrict_dir_perms(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 fn latin1_transliterate(input: &str) -> Vec<u8> {
@@ -524,6 +651,7 @@ fn transliterate_non_latin1(ch: char) -> Option<&'static str> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use tempfile::TempDir;
 
@@ -781,5 +909,113 @@ mod tests {
         store
             .delete_player_credentials()
             .expect("idempotent delete should succeed");
+    }
+
+    #[test]
+    fn credentials_record_debug_redacts_auth_data_and_backup_is_bounded() {
+        let record = CredentialsRecord::new(
+            "alice",
+            Some(1),
+            Some(String::from("super-secret-token-blob")),
+        );
+        let debug_str = format!("{record:?}");
+        assert!(
+            !debug_str.contains("super-secret-token-blob"),
+            "Debug output must redact auth_data: {debug_str}"
+        );
+        assert!(debug_str.contains("[REDACTED]"));
+
+        let dir = TempDir::new().expect("temp dir");
+        let store = AccountStore::new(dir.path());
+        for idx in 0..5 {
+            let id = AccountId::from_username(&format!("corrupt-{idx}"));
+            write_file(&store.account_dir(&id).join(CREDENTIALS_FILE), b"{bad");
+            assert!(store.credentials(&id).expect("recover").is_none());
+        }
+
+        let backups: Vec<PathBuf> = fs::read_dir(store.spotty_dir())
+            .expect("spotty dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("credentials-") && n.ends_with(".json"))
+            })
+            .collect();
+        assert!(
+            backups.len() <= MAX_CREDENTIAL_BACKUPS,
+            "backups must be bounded to {MAX_CREDENTIAL_BACKUPS}, got {}",
+            backups.len()
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for backup in &backups {
+                let mode = fs::metadata(backup).expect("metadata").permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "backup must have 0600 permissions");
+            }
+        }
+
+        store
+            .purge_cache(PurgeScope::PreservePlayerMacs)
+            .expect("purge should clean backups");
+        let remaining_backups: Vec<PathBuf> = fs::read_dir(store.spotty_dir())
+            .expect("spotty dir")
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("credentials-") && n.ends_with(".json"))
+            })
+            .collect();
+        assert!(remaining_backups.is_empty());
+    }
+
+    #[test]
+    fn with_cached_accounts_panic_does_not_poison_and_empty_is_cached() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = AccountStore::new(dir.path());
+
+        let empty = store.all_credentials().expect("empty all_credentials");
+        assert!(empty.is_empty());
+        store.with_cached_accounts(|cached| {
+            assert_eq!(cached, Some(&[][..]), "empty list must be cached");
+        });
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            store.with_cached_accounts(|_| -> () {
+                panic!("simulated caller panic");
+            });
+        }));
+        assert!(res.is_err());
+
+        // Subsequent calls must not panic on poisoned mutex.
+        store.with_cached_accounts(|cached| {
+            assert_eq!(cached, Some(&[][..]));
+        });
+    }
+
+    #[test]
+    fn delete_account_preserves_authenticate_folder() {
+        let dir = TempDir::new().expect("temp dir");
+        let store = AccountStore::new(dir.path());
+
+        let id_a = AccountId::from_username("alice");
+        write_file(
+            &store.account_dir(&id_a).join(CREDENTIALS_FILE),
+            br#"{"username":"alice"}"#,
+        );
+        let auth_dir = store.spotty_dir().join(AUTHENTICATE_DIR);
+        write_file(&auth_dir.join("pending.txt"), b"in-progress");
+
+        store.delete_account(&id_a).expect("delete_account");
+        assert!(!store.account_dir(&id_a).exists());
+        assert!(
+            auth_dir.exists(),
+            "delete_account must not purge __AUTHENTICATE__"
+        );
     }
 }

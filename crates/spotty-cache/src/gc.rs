@@ -81,14 +81,15 @@ impl TempAudioGc {
 
             for entry_res in entries {
                 let entry = entry_res?;
-                let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                let file_name = entry.file_name();
+                let Some(name) = file_name.to_str() else {
                     continue;
                 };
-                if !Self::is_temp_audio_filename(&name) {
+                if !Self::is_temp_audio_filename(name) {
                     continue;
                 }
                 let path = entry.path();
-                let metadata = match fs::metadata(&path) {
+                let metadata = match fs::symlink_metadata(&path) {
                     Ok(meta) => meta,
                     Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
                     Err(err) => return Err(err.into()),
@@ -158,13 +159,20 @@ impl TrackCounter {
     /// Increments the played track count and returns `true` when `threshold` is
     /// reached, resetting the counter to zero on trigger.
     pub fn record_track(&self) -> bool {
-        let next = self.count.fetch_add(1, Ordering::Relaxed) + 1;
-        if next >= self.threshold {
-            self.count.store(0, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
+        let mut triggered = false;
+        let _ = self
+            .count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let next = cur.saturating_add(1);
+                if next >= self.threshold {
+                    triggered = true;
+                    Some(0)
+                } else {
+                    triggered = false;
+                    Some(next)
+                }
+            });
+        triggered
     }
 }
 
@@ -175,6 +183,7 @@ impl Default for TrackCounter {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::thread;
 
@@ -243,5 +252,52 @@ mod tests {
             "counter must trigger on track {CACHE_PURGE_INTERVAL_COUNT}"
         );
         assert_eq!(counter.count(), 0, "counter must reset after trigger");
+    }
+
+    #[test]
+    fn track_counter_concurrent_record_track_triggers_exact_count() {
+        use std::sync::Arc;
+
+        let counter = Arc::new(TrackCounter::new(15));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let c = Arc::clone(&counter);
+                thread::spawn(move || {
+                    let mut triggers = 0usize;
+                    for _ in 0..150 {
+                        if c.record_track() {
+                            triggers += 1;
+                        }
+                    }
+                    triggers
+                })
+            })
+            .collect();
+
+        let total_triggers: usize = threads
+            .into_iter()
+            .map(|h| h.join().expect("worker thread must not panic"))
+            .sum();
+        assert_eq!(total_triggers, 80);
+        assert_eq!(counter.count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temp_audio_gc_ignores_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = TempDir::new().expect("temp dir");
+        let target_dir = TempDir::new().expect("target dir");
+        let target_file = target_dir.path().join("target.ogg");
+        fs::write(&target_file, b"keep").expect("write target");
+
+        let link_path = dir.path().join(".tmp111111");
+        symlink(&target_file, &link_path).expect("create symlink");
+
+        let gc = TempAudioGc::new(Duration::ZERO);
+        let swept = gc.sweep([dir.path()]).expect("sweep");
+        assert_eq!(swept, 0);
+        assert!(target_file.exists());
     }
 }
