@@ -105,8 +105,9 @@ pub fn parse_folder_blob(bytes: &[u8]) -> Result<HashMap<String, FolderEntry>> {
                 );
                 order += 1;
             }
-        } else if item.starts_with(b"tart-group") {
+        } else if item.starts_with(b"tart-group:") {
             let Some((folder_id, name)) = parse_start_group(item) else {
+                stack.push(parent.clone());
                 continue;
             };
             entries.insert(
@@ -121,7 +122,7 @@ pub fn parse_folder_blob(bytes: &[u8]) -> Result<HashMap<String, FolderEntry>> {
             order += 1;
             stack.push(parent);
             parent = folder_id;
-        } else if item.starts_with(b"nd-group") {
+        } else if item.starts_with(b"nd-group:") {
             parent = stack.pop().unwrap_or_else(|| String::from("/"));
         }
     }
@@ -204,23 +205,11 @@ fn parse_playlist_id(rest: &[u8]) -> Option<&str> {
 }
 
 fn parse_start_group(item: &[u8]) -> Option<(String, String)> {
-    let mut parts: Vec<&[u8]> = Vec::new();
-    let mut start = 0;
-    for (idx, &byte) in item.iter().enumerate() {
-        if byte == b':' {
-            parts.push(&item[start..idx]);
-            start = idx + 1;
-        }
-    }
-    parts.push(&item[start..]);
-
-    if parts.len() < 3 {
-        return None;
-    }
-
-    let raw_id = parts[parts.len() - 2];
-    let raw_name = parts[parts.len() - 1];
-    if raw_id.is_empty() {
+    let rest = item.strip_prefix(b"tart-group:")?;
+    let colon_pos = rest.iter().position(|&byte| byte == b':')?;
+    let raw_id = &rest[..colon_pos];
+    let raw_name = &rest[colon_pos + 1..];
+    if raw_id.is_empty() || raw_id == b"/" {
         return None;
     }
 
@@ -252,7 +241,7 @@ fn percent_unescape_and_space(raw: &[u8]) -> Vec<u8> {
         if raw[idx] == b'%' && idx + 2 < raw.len() {
             if let (Some(hi), Some(lo)) = (hex_val(raw[idx + 1]), hex_val(raw[idx + 2])) {
                 let decoded = (hi << 4) | lo;
-                out.push(if decoded == b'+' { b' ' } else { decoded });
+                out.push(decoded);
                 idx += 3;
                 continue;
             }
@@ -387,6 +376,40 @@ mod tests {
         assert!(
             parsed.contains_key("spotify:playlist:aaaaaaaaaaaaaaaaaaaaaa"),
             "22-char alphanumeric prefix should be recorded"
+        );
+    }
+
+    #[test]
+    fn preserves_colons_and_percent_encoded_plus_and_stack_balance() {
+        let blob = b"spotify:start-group:outer:C%2B%2B:+Vol+1\r\
+            spotify:start-group::malformed\r\
+            spotify:end-group:malformed\r\
+            spotify:start-group:/:Slash+Id\r\
+            spotify:end-group:/\r\
+            spotify:playlist:1111111111111111111111\r\
+            spotify:end-group:outer\r";
+
+        let parsed = parse_folder_blob(blob).expect("blob should parse");
+        assert_eq!(
+            parsed.get("outer"),
+            Some(&FolderEntry::Folder {
+                id: String::from("outer"),
+                name: String::from("C++: Vol 1"),
+                parent: String::from("/"),
+                order: 0,
+            })
+        );
+        assert!(
+            !parsed.contains_key("/"),
+            "root id '/' must be rejected as a folder id"
+        );
+        assert_eq!(
+            parsed.get("spotify:playlist:1111111111111111111111"),
+            Some(&FolderEntry::Playlist {
+                uri: String::from("spotify:playlist:1111111111111111111111"),
+                parent: String::from("outer"),
+                order: 1,
+            })
         );
     }
 }

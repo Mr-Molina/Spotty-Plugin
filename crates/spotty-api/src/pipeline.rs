@@ -94,6 +94,10 @@ impl Pipeline {
         self
     }
 
+    pub(crate) fn max_concurrency(&self) -> usize {
+        self.max_concurrency
+    }
+
     /// Probes page `0`, propagates [`CachePolicy::SkipRevalidate`] when page `0`
     /// came from cache, and fans out remaining offset pages concurrently under a
     /// [`Semaphore`], sorting results deterministically by `usize` offset.
@@ -126,7 +130,11 @@ impl Pipeline {
         let page0 = extract(&json0)?;
 
         let target_total = page0.total.min(effective_max);
-        if target_total <= page_size || page0.items.is_empty() {
+        let raw_items_empty = json0
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty);
+        if target_total <= page_size || raw_items_empty {
             return Ok(page0.items);
         }
 
@@ -138,7 +146,7 @@ impl Pipeline {
 
         let mut offsets = Vec::new();
         let mut offset = page_size;
-        while offset < target_total && offsets.len() < self.max_iterations {
+        while offset < target_total && offsets.len() + 1 < self.max_iterations {
             offsets.push(offset);
             offset = offset.saturating_add(page_size);
         }
@@ -464,12 +472,8 @@ mod tests {
         // Mark page 1..3 entries expired in cache while page 0 remains fresh;
         // SkipRevalidate propagation must serve them with zero extra HTTP hits.
         for offset in [50usize, 100, 150] {
-            let key = {
-                use md5::Digest as _;
-                let rel = format!("me/tracks?limit=50&offset={offset}");
-                let digest = md5::Md5::digest(format!("{rel}tok-pipe").as_bytes());
-                format!("{digest:x}")
-            };
+            let rel = format!("me/tracks?limit=50&offset={offset}");
+            let key = crate::transport::compute_http_cache_key(&rel, "alice");
             let existing = cache
                 .http_entry(&key)
                 .expect("read cached page")
@@ -592,5 +596,84 @@ mod tests {
             .expect("indexed chunk execution should succeed");
 
         assert_eq!(assembled, vec![10, 11, 20, 21, 30, 31]);
+    }
+
+    #[tokio::test]
+    async fn fetch_offset_parallel_continues_when_page0_filters_to_empty() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/tracks"))
+            .and(query_param("limit", "2"))
+            .and(query_param("offset", "0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [1, 2],
+                "total": 4,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/tracks"))
+            .and(query_param("limit", "2"))
+            .and(query_param("offset", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "items": [3, 4],
+                "total": 4,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (pipeline, _) = build_pipeline(&server.uri(), &tmp);
+
+        let items = pipeline
+            .fetch_offset_parallel("me/tracks", &[], 2, 10, CachePolicy::BypassCache, |val| {
+                let raw = extract_u64_items(val);
+                let total = usize::try_from(val["total"].as_u64().unwrap_or(0)).unwrap_or(0);
+                // Filter out page 0 items completely; page 1 items must still be fetched.
+                let filtered = raw.into_iter().filter(|&n| n > 2).collect();
+                Ok(OffsetPage::new(filtered, total, None))
+            })
+            .await
+            .expect("pagination should continue past empty filtered page 0");
+
+        assert_eq!(items, vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn fetch_offset_parallel_respects_exact_max_iterations_including_page0() {
+        let server = MockServer::start().await;
+
+        for offset in [0usize, 2] {
+            Mock::given(method("GET"))
+                .and(path("/v1/me/tracks"))
+                .and(query_param("limit", "2"))
+                .and(query_param("offset", offset.to_string()))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "items": [offset as u64, offset as u64 + 1],
+                    "total": 10,
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let tmp = TempDir::new().expect("tempdir");
+        let (pipeline, _) = build_pipeline(&server.uri(), &tmp);
+        let bounded = pipeline.with_max_iterations(2);
+
+        let items = bounded
+            .fetch_offset_parallel("me/tracks", &[], 2, 10, CachePolicy::BypassCache, |val| {
+                let items = extract_u64_items(val);
+                let total = usize::try_from(val["total"].as_u64().unwrap_or(0)).unwrap_or(0);
+                Ok(OffsetPage::new(items, total, None))
+            })
+            .await
+            .expect("max_iterations=2 should fetch page 0 and page 1 only");
+
+        assert_eq!(items, vec![0, 1, 2, 3]);
     }
 }

@@ -1,7 +1,7 @@
 //! `OAuth2` PKCE challenge generation and single-flight Spotify token manager.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use reqwest::Client;
@@ -10,7 +10,7 @@ use serde_json::Value;
 use sha2::Sha256;
 use spotty_cache::{AccountId, AccountStore, DualCache};
 use spotty_types::{IconCode, Result, SpottyError};
-use tokio::sync::{watch, Mutex};
+use tokio::sync::watch;
 use tracing::{error, info};
 
 /// Default Spotify `OAuth2` token endpoint URL.
@@ -140,6 +140,36 @@ struct SpotifyTokenResponse {
 }
 
 type InflightReceiver = watch::Receiver<Option<Result<String>>>;
+type InflightMap = Arc<Mutex<HashMap<String, InflightReceiver>>>;
+
+struct InflightGuard {
+    inflight: InflightMap,
+    flight_key: String,
+    active: bool,
+}
+
+impl InflightGuard {
+    fn new(inflight: &InflightMap, flight_key: String) -> Self {
+        Self {
+            inflight: Arc::clone(inflight),
+            flight_key,
+            active: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let mut guard = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.remove(&self.flight_key);
+        }
+    }
+}
 
 /// Manages Spotify `OAuth2` PKCE exchanges and single-flight token refreshes.
 #[derive(Debug)]
@@ -149,12 +179,12 @@ pub struct TokenManager {
     cache: Arc<DualCache>,
     accounts: Arc<AccountStore>,
     startup_epoch: u64,
-    inflight: Mutex<HashMap<String, InflightReceiver>>,
+    inflight: InflightMap,
 }
 
 impl TokenManager {
     /// Creates a [`TokenManager`] using [`DEFAULT_TOKEN_URL`] and a `rustls`
-    /// `reqwest` client with a 30-second timeout.
+    /// `reqwest` client with a 10-second connect timeout and 30-second timeout.
     ///
     /// # Errors
     ///
@@ -162,6 +192,7 @@ impl TokenManager {
     /// initialized.
     pub fn new(cache: Arc<DualCache>, accounts: Arc<AccountStore>) -> Result<Self> {
         let http_client = Client::builder()
+            .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30))
             .gzip(true)
             .use_rustls_tls()
@@ -192,8 +223,14 @@ impl TokenManager {
             cache,
             accounts,
             startup_epoch,
-            inflight: Mutex::new(HashMap::new()),
+            inflight: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Returns a reference to the shared `reqwest` HTTP client.
+    #[must_use]
+    pub fn http_client(&self) -> &Client {
+        &self.http_client
     }
 
     /// Returns the configured `OAuth2` token endpoint URL.
@@ -269,16 +306,17 @@ impl TokenManager {
         }
 
         let flight_key = format!("{}:{}", client_id.as_str(), user_id);
-        let (leader_tx, mut follower_rx) = {
-            let mut guard = self.inflight.lock().await;
+        let (leader_tx, mut follower_rx, mut inflight_guard) = {
+            let mut guard = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(existing_rx) = guard.get(&flight_key) {
-                (None, Some(existing_rx.clone()))
+                (None, Some(existing_rx.clone()), None)
             } else if let Some(cached) = self.read_cached_token(&at_key)? {
                 return Ok(cached);
             } else {
                 let (tx, rx) = watch::channel(None);
                 guard.insert(flight_key.clone(), rx);
-                (Some(tx), None)
+                let drop_guard = InflightGuard::new(&self.inflight, flight_key.clone());
+                (Some(tx), None, Some(drop_guard))
             }
         };
 
@@ -301,15 +339,30 @@ impl TokenManager {
 
         let outcome = self.refresh_leader(client_id, user_id).await;
         {
-            let mut guard = self.inflight.lock().await;
+            let mut guard = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
             guard.remove(&flight_key);
+        }
+        if let Some(mut drop_guard) = inflight_guard.take() {
+            drop_guard.disarm();
         }
         let _ignored = tx.send(Some(outcome.clone()));
         outcome
     }
 
-    /// Persists an access token (TTL `expires_in.saturating_sub(300)`) and an
-    /// optional refresh token (180-day TTL) into [`DualCache`].
+    /// Evicts the cached startup-epoch access token for `(client_id, user_id)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SpottyError::Cache`] if deleting from [`DualCache`] fails.
+    pub fn invalidate_access_token(&self, client_id: &IconCode, user_id: &str) -> Result<()> {
+        let at_key = self.access_token_key(client_id, user_id);
+        let _removed = self.cache.remove_ephemeral(&at_key)?;
+        Ok(())
+    }
+
+    /// Persists an access token (using a 300s refresh margin, or `expires_in / 2`
+    /// when `expires_in <= 300`) and an optional refresh token (180-day TTL) into
+    /// [`DualCache`].
     ///
     /// # Errors
     ///
@@ -324,7 +377,7 @@ impl TokenManager {
         refresh_token: Option<&str>,
     ) -> Result<()> {
         let at_key = self.access_token_key(client_id, user_id);
-        let at_ttl_secs = expires_in.saturating_sub(ACCESS_TOKEN_REFRESH_MARGIN_SECS);
+        let at_ttl_secs = compute_access_token_ttl_secs(expires_in);
         let at_val = Value::String(access_token.to_owned());
         self.cache
             .put_ephemeral(&at_key, &at_val, Duration::from_secs(at_ttl_secs))?;
@@ -447,6 +500,16 @@ impl TokenManager {
             client_id.as_str(),
             user_id
         )
+    }
+}
+
+fn compute_access_token_ttl_secs(expires_in: u64) -> u64 {
+    if expires_in > ACCESS_TOKEN_REFRESH_MARGIN_SECS {
+        expires_in - ACCESS_TOKEN_REFRESH_MARGIN_SECS
+    } else if expires_in > 1 {
+        expires_in / 2
+    } else {
+        expires_in
     }
 }
 
@@ -670,5 +733,55 @@ mod tests {
         assert_eq!(bundle.refresh_token.as_deref(), Some("pkce-rt"));
         assert_eq!(bundle.expires_in, 3600);
         assert_eq!(bundle.token_type.as_deref(), Some("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_leader_cleans_up_inflight_key_for_subsequent_callers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(150))
+                    .set_body_json(json!({
+                        "access_token": "recovered-access-token",
+                        "refresh_token": "rotated-rt",
+                        "expires_in": 3600
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = TempDir::new().expect("temp dir");
+        let (manager, _) = test_manager(&server.uri(), &tmp);
+        let client_id = IconCode::default();
+        manager
+            .cache_tokens(&client_id, "bob", "", 0, Some("seed-rt"))
+            .expect("seed refresh token");
+
+        // Cancel the leader future mid-flight via a short timeout.
+        let timed_out = tokio::time::timeout(
+            Duration::from_millis(20),
+            manager.access_token_for(&client_id, "bob"),
+        )
+        .await;
+        assert!(timed_out.is_err(), "first call should time out mid-flight");
+
+        // Subsequent caller must not get stuck on a leaked inflight entry.
+        let recovered = manager
+            .access_token_for(&client_id, "bob")
+            .await
+            .expect("subsequent caller should recover and succeed");
+        assert_eq!(recovered, "recovered-access-token");
+    }
+
+    #[test]
+    fn short_lived_expires_in_uses_proportional_ttl_margin() {
+        assert_eq!(super::compute_access_token_ttl_secs(3600), 3300);
+        assert_eq!(super::compute_access_token_ttl_secs(300), 150);
+        assert_eq!(super::compute_access_token_ttl_secs(60), 30);
+        assert_eq!(super::compute_access_token_ttl_secs(1), 1);
+        assert_eq!(super::compute_access_token_ttl_secs(0), 0);
     }
 }
