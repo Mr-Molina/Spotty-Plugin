@@ -41,7 +41,7 @@ sub explodePlaylist {
 }
 
 sub trackGain {
-	my ($class, $client, $url, $remote_gain) = @_;
+	my ($class, $client, $url, $remote_gain, $remote_album_gain) = @_;
 	my $server_mode;
 	if (eval { require Slim::Utils::Prefs; 1 }) {
 		$server_mode = Slim::Utils::Prefs::preferences('server')->get('replayGainMode');
@@ -50,6 +50,7 @@ sub trackGain {
 		player_id => ($client ? $client->id : undef),
 		(defined $server_mode ? (server_mode => "$server_mode") : ()),
 		(defined $remote_gain ? (remote_replay_gain => 0 + $remote_gain) : ()),
+		(defined $remote_album_gain ? (remote_album_gain => 0 + $remote_album_gain) : ()),
 	});
 	return ref($res) eq 'HASH' ? $res->{gain} : $res;
 }

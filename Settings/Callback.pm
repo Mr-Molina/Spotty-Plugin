@@ -54,9 +54,15 @@ sub oauthRedirect {
 sub oauthCallback {
 	my ($client, $params, $callback, $httpClient, $response) = @_;
 	my $code = ref($params) eq 'HASH' ? $params->{code} : undef;
+	my $state = ref($params) eq 'HASH' ? $params->{state} : undef;
+	my $oauth_error = ref($params) eq 'HASH' ? $params->{error} : undef;
+	my $error_desc = ref($params) eq 'HASH' ? $params->{error_description} : undef;
 
 	Plugins::Spotty::SpottyBridge->call_async('settings.oauth_callback', {
 		(defined $code ? (code => "$code") : ()),
+		(defined $state ? (state => "$state") : ()),
+		(defined $oauth_error ? (error => "$oauth_error") : ()),
+		(defined $error_desc ? (error_description => "$error_desc") : ()),
 	}, sub {
 		my ($res, $err) = @_;
 		if ($err) {

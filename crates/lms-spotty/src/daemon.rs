@@ -14,7 +14,7 @@ use spotty_api::{
     SpotifyClient, SpotifyTransport, TokenManager, TrackCacheLookup,
 };
 use spotty_audio::{
-    resolve_lms_track_gain, HelperCapabilities, ServerReplayGainMode, TranscodeTableBuilder,
+    resolve_lms_gain, HelperCapabilities, ServerReplayGainMode, TranscodeTableBuilder,
 };
 use spotty_cache::{AccountStore, DualCache};
 use spotty_importer::{online_library_needs_update, PlaylistSyncPolicy};
@@ -155,8 +155,18 @@ impl DaemonState {
             load_persisted_state(&cache, CACHE_KEY_GLOBAL_PREFS, now).unwrap_or_default();
         let player_prefs: HashMap<String, PlayerPrefs> =
             load_persisted_state(&cache, CACHE_KEY_PLAYER_PREFS, now).unwrap_or_default();
-        let recent_searches: RecentSearchesStore =
-            load_persisted_state(&cache, CACHE_KEY_RECENT_SEARCHES, now).unwrap_or_default();
+        let mut recent_searches = RecentSearchesStore::open_or_load(Arc::clone(&cache))
+            .unwrap_or_else(|_| RecentSearchesStore::new().with_cache(Arc::clone(&cache)));
+        if recent_searches.is_empty() {
+            if let Some(legacy) =
+                load_persisted_state::<RecentSearchesStore>(&cache, CACHE_KEY_RECENT_SEARCHES, now)
+            {
+                if !legacy.is_empty() {
+                    recent_searches = legacy.with_cache(Arc::clone(&cache));
+                    let _ = recent_searches.save();
+                }
+            }
+        }
         let disabled_formats: Vec<String> =
             load_persisted_state(&cache, CACHE_KEY_DISABLED_FORMATS, now).unwrap_or_default();
 
@@ -750,6 +760,7 @@ async fn handle_opml_feed(
 struct RecentSearchesParams {
     action: Option<String>,
     query: Option<String>,
+    term: Option<String>,
     delete_index: Option<usize>,
     delete_label: Option<String>,
     clear_label: Option<String>,
@@ -773,7 +784,20 @@ fn handle_recent_searches(
             let query = parsed.query.as_deref().ok_or_else(|| {
                 RpcDispatchError::InvalidParams(String::from("Missing query for add"))
             })?;
-            store.add(query);
+            store.add_persisted(query)?;
+            state.persist_recent_searches(&store);
+            let items: Vec<String> = store.mru_items().into_iter().map(str::to_owned).collect();
+            Ok(json!({ "items": items, "count": store.len() }))
+        }
+        "delete_term" => {
+            let term = parsed
+                .term
+                .as_deref()
+                .or(parsed.query.as_deref())
+                .ok_or_else(|| {
+                    RpcDispatchError::InvalidParams(String::from("Missing term for delete_term"))
+                })?;
+            store.delete_term(term)?;
             state.persist_recent_searches(&store);
             let items: Vec<String> = store.mru_items().into_iter().map(str::to_owned).collect();
             Ok(json!({ "items": items, "count": store.len() }))
@@ -787,6 +811,7 @@ fn handle_recent_searches(
                 delete_label,
                 clear_label,
             )?;
+            let _ = store.save();
             state.persist_recent_searches(&store);
             Ok(serde_json::to_value(resp)?)
         }
@@ -796,6 +821,7 @@ fn handle_recent_searches(
                 delete_label,
                 clear_label,
             )?;
+            let _ = store.save();
             state.persist_recent_searches(&store);
             Ok(serde_json::to_value(resp)?)
         }
@@ -913,6 +939,7 @@ struct TrackGainParams {
     player_id: Option<String>,
     server_mode: Option<String>,
     remote_replay_gain: Option<f32>,
+    remote_album_gain: Option<f32>,
 }
 
 fn handle_track_gain(
@@ -946,7 +973,12 @@ fn handle_track_gain(
         _ => ServerReplayGainMode::Smart,
     };
 
-    let gain = resolve_lms_track_gain(policy, mode, parsed.remote_replay_gain);
+    let gain = resolve_lms_gain(
+        policy,
+        mode,
+        parsed.remote_replay_gain,
+        parsed.remote_album_gain,
+    );
     Ok(json!({ "gain": gain }))
 }
 
@@ -1227,6 +1259,9 @@ async fn handle_settings_oauth_prepare(
 #[serde(default)]
 struct OauthCallbackParams {
     code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
     client_id: Option<String>,
 }
 
@@ -1245,7 +1280,13 @@ async fn handle_settings_oauth_callback(
         Arc::clone(&state.tokens),
     )?;
     let vm = controller
-        .handle_oauth_callback(&icon_code, parsed.code.as_deref())
+        .handle_oauth_callback_verified(
+            &icon_code,
+            parsed.code.as_deref(),
+            parsed.state.as_deref(),
+            parsed.error.as_deref(),
+            parsed.error_description.as_deref(),
+        )
         .await?;
     Ok(serde_json::to_value(vm)?)
 }

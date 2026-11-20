@@ -250,6 +250,7 @@ mod tests {
         )
         .expect("write credentials.json");
 
+        let accounts = AccountStore::new(tmp.path());
         assert!(
             LastMixService::is_enabled(&accounts, Some(&cid)),
             "valid client_id and credentials must enable LastMix"

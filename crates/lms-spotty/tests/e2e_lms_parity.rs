@@ -1,5 +1,7 @@
 //! End-to-end 6-journey LMS parity and live Perl-to-Rust RPC verification.
 
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -243,10 +245,11 @@ async fn journey_1_pkce_oauth_and_credential_promotion() {
         "authenticate status must be false before callback: {before_cb:?}"
     );
 
+    let state = query.get("state").map(String::as_str);
     let callback_vm = controller
-        .handle_oauth_callback(&client_id, Some("oauth-code-123"))
+        .handle_oauth_callback_verified(&client_id, Some("oauth-code-123"), state, None, None)
         .await
-        .expect("handle_oauth_callback should succeed");
+        .expect("handle_oauth_callback_verified should succeed");
     assert!(
         callback_vm.auth_error.is_none(),
         "callback should not report auth_error: {callback_vm:?}"
@@ -825,7 +828,10 @@ async fn journey_4_lms_integrations_dstm_home_extras_and_last_mix() {
     let lm_track = sample_track("lm001", "Digital Love", "dp1", "Daft Punk", "disc1");
     Mock::given(method("GET"))
         .and(path("/v1/search"))
-        .and(query_param("q", "artist:Daft Punk track:Digital Love"))
+        .and(query_param(
+            "q",
+            "artist:\"Daft Punk\" track:\"Digital Love\"",
+        ))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "tracks": {
                 "items": [lm_track],
@@ -838,7 +844,7 @@ async fn journey_4_lms_integrations_dstm_home_extras_and_last_mix() {
 
     Mock::given(method("GET"))
         .and(path("/v1/search"))
-        .and(query_param("q", "artist:Nobody track:Nothing"))
+        .and(query_param("q", "artist:\"Nobody\" track:\"Nothing\""))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "tracks": {
                 "items": [],
@@ -1036,6 +1042,288 @@ print encode_json({
         5
     );
     assert_eq!(decoded["shutdown"]["status"], json!("shutting_down"));
+
+    server_handle
+        .await
+        .expect("join SpottyDaemon serve task")
+        .expect("SpottyDaemon should exit cleanly after system.shutdown");
+    assert!(
+        !endpoint_path.exists(),
+        "daemon.endpoint must be removed on shutdown"
+    );
+}
+
+#[tokio::test]
+async fn journey_7_all_perl_shims_live_roundtrip() {
+    let Some(perl_exe) = resolve_perl_executable() else {
+        return;
+    };
+
+    let temp = TempDir::new().expect("create tempdir");
+    let config = DaemonConfig::new(temp.path()).with_sweep_interval(Duration::from_secs(60));
+    let endpoint_path = config.endpoint_file.clone();
+
+    let daemon = SpottyDaemon::bind(config)
+        .await
+        .expect("bind SpottyDaemon for all-Perl-shims test");
+    let _endpoint = read_endpoint_file(&endpoint_path).expect("read daemon.endpoint");
+    let server_handle = tokio::spawn(async move { daemon.serve().await });
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("resolve workspace root");
+
+    let perl_stubs_dir = temp.path().join("perl_stubs");
+    std::fs::create_dir_all(perl_stubs_dir.join("Slim/Utils/Prefs"))
+        .expect("create Slim/Utils/Prefs stub dir");
+    std::fs::create_dir_all(perl_stubs_dir.join("Slim/Web/HTTP"))
+        .expect("create Slim/Web/HTTP stub dir");
+    std::fs::create_dir_all(perl_stubs_dir.join("Slim/Player"))
+        .expect("create Slim/Player stub dir");
+    std::fs::create_dir_all(perl_stubs_dir.join("Slim/Control"))
+        .expect("create Slim/Control stub dir");
+    std::fs::create_dir_all(perl_stubs_dir.join("Slim/Music")).expect("create Slim/Music stub dir");
+    std::fs::create_dir_all(perl_stubs_dir.join("Slim/Plugin"))
+        .expect("create Slim/Plugin stub dir");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Utils/Prefs.pm"),
+        r#"package Slim::Utils::Prefs;
+use strict; use warnings;
+our $CACHE_DIR = $ENV{SPOTTY_TEST_CACHE_DIR} || '';
+sub preferences {
+    my ($ns) = @_;
+    return bless { ns => ($ns || 'server') }, 'Slim::Utils::Prefs::Mock';
+}
+package Slim::Utils::Prefs::Mock;
+sub get {
+    my ($self, $k) = @_;
+    return $Slim::Utils::Prefs::CACHE_DIR if $k eq 'cachedir';
+    return 2 if $k eq 'replayGainMode';
+    return [];
+}
+sub set {}
+1;
+"#,
+    )
+    .expect("write Slim/Utils/Prefs.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Utils/OSDetect.pm"),
+        r#"package Slim::Utils::OSDetect;
+sub dirsFor { return ($ENV{SPOTTY_TEST_CACHE_DIR}); }
+sub details { return { os => 'Linux', osArch => 'x86_64-linux' }; }
+1;
+"#,
+    )
+    .expect("write Slim/Utils/OSDetect.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Utils/Log.pm"),
+        "package Slim::Utils::Log;\n\
+         sub addLogCategory {\n\
+           return bless {}, 'Slim::Utils::Log::Mock';\n\
+         }\n\
+         package Slim::Utils::Log::Mock;\n\
+         sub info {}\n\
+         sub warn {}\n\
+         sub error {}\n\
+         sub debug {}\n\
+         1;\n",
+    )
+    .expect("write Slim/Utils/Log.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Utils/Network.pm"),
+        "package Slim::Utils::Network;\n\
+         sub serverURL { return 'http://127.0.0.1:9000'; }\n\
+         1;\n",
+    )
+    .expect("write Slim/Utils/Network.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Web/Pages.pm"),
+        "package Slim::Web::Pages;\n\
+         our %ROUTES;\n\
+         sub addPageFunction {\n\
+           my ($c, $p, $fn) = @_;\n\
+           $ROUTES{$p} = $fn;\n\
+         }\n\
+         1;\n",
+    )
+    .expect("write Slim/Web/Pages.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Web/HTTP/CSRF.pm"),
+        "package Slim::Web::HTTP::CSRF;\n\
+         sub protectURI { my ($c, $p) = @_; return $p; }\n\
+         1;\n",
+    )
+    .expect("write Slim/Web/HTTP/CSRF.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Web/HTTP.pm"),
+        "package Slim::Web::HTTP;\n\
+         sub filltemplatefile {\n\
+           my ($tpl, $params) = @_;\n\
+           return { template => $tpl, params => $params };\n\
+         }\n\
+         1;\n",
+    )
+    .expect("write Slim/Web/HTTP.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Web/Settings.pm"),
+        "package Slim::Web::Settings;\n\
+         sub new { my ($c) = @_; return bless {}, $c; }\n\
+         sub handler {\n\
+           my ($self, $client, $params) = @_;\n\
+           return $params;\n\
+         }\n\
+         1;\n",
+    )
+    .expect("write Slim/Web/Settings.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Plugin/OPMLBased.pm"),
+        "package Slim::Plugin::OPMLBased;\nour @ISA = ();\nsub initPlugin {}\n1;\n",
+    )
+    .expect("write Slim/Plugin/OPMLBased.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Player/ProtocolHandlers.pm"),
+        "package Slim::Player::ProtocolHandlers;\nsub registerHandler {}\n1;\n",
+    )
+    .expect("write Slim/Player/ProtocolHandlers.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Control/Request.pm"),
+        "package Slim::Control::Request;\nsub addDispatch {}\n1;\n",
+    )
+    .expect("write Slim/Control/Request.pm");
+
+    std::fs::write(
+        perl_stubs_dir.join("Slim/Music/Import.pm"),
+        "package Slim::Music::Import;\nsub addImporter {}\n1;\n",
+    )
+    .expect("write Slim/Music/Import.pm");
+
+    let perl_script = r#"
+use strict;
+use warnings;
+use JSON::PP qw(encode_json);
+
+my ($repo_root, $cache_dir) = @ARGV;
+unshift @INC, $repo_root;
+
+require 'SpottyBridge.pm';
+$INC{'Plugins/Spotty/SpottyBridge.pm'} = "$repo_root/SpottyBridge.pm";
+require 'Plugin.pm';
+$INC{'Plugins/Spotty/Plugin.pm'} = "$repo_root/Plugin.pm";
+require 'ProtocolHandler.pm';
+require 'Importer.pm';
+require 'Settings.pm';
+$INC{'Plugins/Spotty/Settings.pm'} = "$repo_root/Settings.pm";
+require 'Settings/Auth.pm';
+require 'Settings/Callback.pm';
+$INC{'Plugins/Spotty/Settings/Callback.pm'} = "$repo_root/Settings/Callback.pm";
+require 'Settings/Player.pm';
+require 'Settings/PlayerAuth.pm';
+require 'Settings/PlaylistFolders.pm';
+
+my $gain = Plugins::Spotty::ProtocolHandler->trackGain(
+    undef, 'spotify:track:abc', -3.5, -6.0
+);
+my $needs = Plugins::Spotty::Importer->needsUpdate();
+my $basic = Plugins::Spotty::Settings->handler(undef, {});
+my $auth_res = Plugins::Spotty::Settings::Auth->handler(
+    undef, { hasCredentials => 1 }
+);
+my $cb_res = Plugins::Spotty::Settings::Callback::oauthCallback(
+    undef, { error => 'access_denied', error_description => 'denied' }
+);
+my $player_res = Plugins::Spotty::Settings::Player->handler(
+    undef,
+    { player => 'aa:bb:cc:dd:ee:ff' },
+    sub { my ($c, $p) = @_; return $p; }
+);
+my $pa_res = Plugins::Spotty::Settings::PlayerAuth->handler(
+    undef, { player => 'aa:bb:cc:dd:ee:ff', hasPlayerCredentials => 1 }
+);
+my $pf_res = Plugins::Spotty::Settings::PlaylistFolders->handler(undef, {});
+my $shut = Plugins::Spotty::SpottyBridge->call(
+    'system.shutdown', {}, cache_dir => $cache_dir
+);
+
+print encode_json({
+    gain      => $gain,
+    needs     => $needs,
+    basic     => $basic,
+    auth      => $auth_res,
+    callback  => $cb_res,
+    player    => $player_res,
+    player_auth => $pa_res,
+    folders   => $pf_res,
+    shutdown  => $shut,
+}) . "\n";
+"#;
+
+    let stubs_arg = perl_stubs_dir.to_string_lossy().into_owned();
+    let repo_arg = repo_root.to_string_lossy().into_owned();
+    let cache_arg = temp.path().to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(&perl_exe)
+            .env("SPOTTY_TEST_CACHE_DIR", &cache_arg)
+            .args(["-I", &stubs_arg, "-e", perl_script, &repo_arg, &cache_arg])
+            .output()
+            .expect("spawn Perl for all shims test")
+    })
+    .await
+    .expect("join blocking Perl shims test");
+
+    assert!(
+        output.status.success(),
+        "Perl all-shims round-trip failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let decoded: Value =
+        serde_json::from_slice(&output.stdout).expect("decode all-shims Perl JSON output");
+    assert_eq!(decoded["shutdown"]["status"], json!("shutting_down"));
+    assert_eq!(decoded["gain"], json!(-6));
+    assert!(
+        decoded["needs"] == json!(0)
+            || decoded["needs"] == json!(1)
+            || decoded["needs"].is_boolean(),
+        "Importer->needsUpdate must return 0/1/bool: {decoded}"
+    );
+    assert!(
+        decoded["basic"].is_object(),
+        "Settings->handler must return JSON object: {decoded}"
+    );
+    assert!(
+        decoded["auth"].is_object(),
+        "Settings::Auth->handler must return JSON object: {decoded}"
+    );
+    assert!(
+        decoded["callback"]["params"]["auth_error"].is_string()
+            || decoded["callback"]["auth_error"].is_string(),
+        "Settings::Callback->oauthCallback must return auth_error for access_denied: {decoded}"
+    );
+    assert!(
+        decoded["player"].is_object(),
+        "Settings::Player->handler must return JSON object: {decoded}"
+    );
+    assert!(
+        decoded["player_auth"].is_object(),
+        "Settings::PlayerAuth->handler must return JSON object: {decoded}"
+    );
+    assert!(
+        decoded["folders"].is_object(),
+        "Settings::PlaylistFolders->handler must return JSON object: {decoded}"
+    );
 
     server_handle
         .await
