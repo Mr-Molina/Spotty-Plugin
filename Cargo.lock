@@ -1633,6 +1633,7 @@ name = "spotty-cache"
 version = "4.62.3"
 dependencies = [
  "md-5",
+ "proptest",
  "redb",
  "serde",
  "serde_json",
