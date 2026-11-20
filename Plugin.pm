@@ -20,6 +20,11 @@ BEGIN {
 sub initPlugin {
 	my ($class, @args) = @_;
 
+	my $bin_arch_dir = File::Spec->catdir(dirname(File::Spec->rel2abs(__FILE__)), 'Bin', $Config{archname} || '');
+	if (-d $bin_arch_dir && eval { require Slim::Utils::Misc; Slim::Utils::Misc->can('addFindBinPaths') }) {
+		Slim::Utils::Misc::addFindBinPaths($bin_arch_dir);
+	}
+
 	my $helper_bin = eval { Plugins::Spotty::SpottyBridge->resolve_binary() };
 	Plugins::Spotty::SpottyBridge->call('plugin.init', {
 		arch       => $Config{archname} || '',

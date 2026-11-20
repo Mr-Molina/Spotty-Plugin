@@ -4,5 +4,6 @@ spotty-custom
 .history
 cloud
 /target/
+/dist/
 __pycache__/
 *.pyc

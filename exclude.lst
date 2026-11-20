@@ -6,6 +6,7 @@ Spotty/**/findSpotifyFolderFiles.*
 Spotty/**/test.sh
 Spotty/cloud*
 Spotty/target/**
+Spotty/dist/**
 Spotty/crates/**
 Spotty/Cargo.toml
 Spotty/Cargo.lock
