@@ -1,4 +1,4 @@
-//! Native SQLite online-library importer targeting LMS `library.db`.
+//! Native `SQLite` online-library importer targeting LMS `library.db`.
 
 pub mod needs_update;
 pub mod runner;

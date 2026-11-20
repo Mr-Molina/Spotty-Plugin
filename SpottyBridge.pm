@@ -8,6 +8,7 @@ use File::Basename qw(dirname);
 use File::Spec;
 use IO::Socket::INET;
 use JSON::PP qw(decode_json encode_json);
+use POSIX ();
 use Time::HiRes qw(sleep);
 
 my $NEXT_ID = 0;

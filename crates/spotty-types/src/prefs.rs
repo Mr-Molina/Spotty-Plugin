@@ -237,7 +237,8 @@ fn is_x86_arch(arch: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use proptest::strategy::Just;
+    use proptest::{prop_assert_eq, prop_oneof, proptest};
 
     use super::*;
     use crate::manifest::DEFAULT_ICON_HASH;

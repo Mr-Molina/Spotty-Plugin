@@ -44,7 +44,7 @@ pub struct CliCommand {
 pub enum CliSubcommand {
     /// Runs the persistent newline-delimited JSON-RPC 2.0 daemon.
     Daemon(DaemonCommandArgs),
-    /// Scans Spotify library accounts into the LMS SQLite `library.db`.
+    /// Scans Spotify library accounts into the LMS `SQLite` `library.db`.
     Scan(ScanCommandArgs),
     /// Streams a Spotify track URI as raw PCM S16LE to stdout.
     Stream(StreamCommandArgs),
@@ -97,7 +97,7 @@ pub struct ScanCommandArgs {
     /// Base cache directory containing `spotty/` accounts and `cache.redb`.
     #[arg(long = "cache-dir")]
     pub cache_dir: PathBuf,
-    /// Path to the LMS `library.db` SQLite database.
+    /// Path to the LMS `library.db` `SQLite` database.
     #[arg(long = "lms-db")]
     pub lms_db: PathBuf,
     /// Scan scope (`full`, `library-only`, or `playlists-only`).

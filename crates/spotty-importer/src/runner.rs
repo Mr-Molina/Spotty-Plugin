@@ -160,7 +160,7 @@ impl ImporterRunner {
     /// # Errors
     ///
     /// Returns [`spotty_types::SpottyError`] if any Spotify API call, cache
-    /// write, or SQLite sink operation fails.
+    /// write, or `SQLite` sink operation fails.
     pub async fn run_scan(
         &self,
         scope: ScanScope,

@@ -246,7 +246,9 @@ fn is_valid_entity_id(kind: SpotifyEntityKind, id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use proptest::arbitrary::any;
+    use proptest::strategy::{Just, Strategy};
+    use proptest::{prop_assert_eq, prop_oneof, proptest};
 
     use super::*;
 

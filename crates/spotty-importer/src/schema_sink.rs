@@ -1,4 +1,4 @@
-//! LMS `library.db` SQLite sink trait and `rusqlite` implementation.
+//! LMS `library.db` `SQLite` sink trait and `rusqlite` implementation.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -16,7 +16,8 @@ pub trait LibrarySink: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if SQLite table creation or cleanup fails.
+    /// Returns [`SpottyError::Database`] if `SQLite` table creation or cleanup
+    /// fails.
     fn init_online_tracks_table(&mut self) -> Result<()>;
 
     /// Upserts prepared track rows and records their URIs in `online_tracks`.
@@ -25,7 +26,7 @@ pub trait LibrarySink: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if the SQLite transaction or statements
+    /// Returns [`SpottyError::Database`] if the `SQLite` transaction or statements
     /// fail.
     fn store_tracks(&mut self, rows: &[LmsTrackRow]) -> Result<usize>;
 
@@ -44,7 +45,7 @@ pub trait LibrarySink: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if the SQLite delete transaction fails.
+    /// Returns [`SpottyError::Database`] if the `SQLite` delete transaction fails.
     fn purge_spotify_playlists(&mut self) -> Result<usize>;
 
     /// Upserts a Spotify playlist with `"Spotify: {name}"` title prefix and
@@ -52,7 +53,7 @@ pub trait LibrarySink: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if the SQLite upsert transaction fails.
+    /// Returns [`SpottyError::Database`] if the `SQLite` upsert transaction fails.
     fn upsert_playlist(
         &mut self,
         uri: &str,
@@ -68,7 +69,7 @@ pub trait LibrarySink: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if the SQLite delete transaction fails.
+    /// Returns [`SpottyError::Database`] if the `SQLite` delete transaction fails.
     fn delete_removed_tracks(&mut self) -> Result<usize>;
 }
 
@@ -91,21 +92,22 @@ impl SqliteLibrarySink {
         })
     }
 
-    /// Opens an in-memory SQLite database initialized with LMS-compatible tables.
+    /// Opens an in-memory `SQLite` database initialized with LMS-compatible tables.
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if opening or initializing SQLite fails.
+    /// Returns [`SpottyError::Database`] if opening or initializing `SQLite` fails.
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().map_err(db_err)?;
         Self::new(conn)
     }
 
-    /// Opens a file-backed SQLite database at `path` and ensures LMS tables exist.
+    /// Opens a file-backed `SQLite` database at `path` and ensures LMS tables
+    /// exist.
     ///
     /// # Errors
     ///
-    /// Returns [`SpottyError::Database`] if opening or initializing SQLite fails.
+    /// Returns [`SpottyError::Database`] if opening or initializing `SQLite` fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path).map_err(db_err)?;
         Self::new(conn)
@@ -115,7 +117,7 @@ impl SqliteLibrarySink {
     ///
     /// # Panics
     ///
-    /// Panics if the internal SQLite connection mutex was poisoned by a prior
+    /// Panics if the internal `SQLite` connection mutex was poisoned by a prior
     /// panic.
     pub fn with_connection<R>(&self, f: impl FnOnce(&Connection) -> R) -> R {
         let guard = self
@@ -129,7 +131,7 @@ impl SqliteLibrarySink {
     ///
     /// # Panics
     ///
-    /// Panics if the internal SQLite connection mutex was poisoned by a prior
+    /// Panics if the internal `SQLite` connection mutex was poisoned by a prior
     /// panic.
     pub fn with_mut_connection<R>(&mut self, f: impl FnOnce(&mut Connection) -> R) -> R {
         let mut guard = self
@@ -143,7 +145,7 @@ impl SqliteLibrarySink {
     ///
     /// # Panics
     ///
-    /// Panics if the internal SQLite connection mutex was poisoned by a prior
+    /// Panics if the internal `SQLite` connection mutex was poisoned by a prior
     /// panic.
     #[must_use]
     pub fn into_connection(self) -> Connection {

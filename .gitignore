@@ -4,3 +4,5 @@ spotty-custom
 .history
 cloud
 /target/
+__pycache__/
+*.pyc

@@ -212,7 +212,7 @@ fn extract_icon_hash(icon_path: &str) -> Result<&str> {
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
+    use proptest::{prop_assert, prop_assert_eq, proptest};
 
     use super::*;
 

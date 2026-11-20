@@ -1,8 +1,9 @@
 //! End-to-end 6-journey LMS parity and live Perl-to-Rust RPC verification.
 
 use std::collections::HashMap;
+use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
@@ -918,12 +919,32 @@ fn journey_5_drop_in_helper_check_handshake() {
     );
 }
 
+fn resolve_perl_executable() -> Option<PathBuf> {
+    if cfg!(windows) {
+        let strawberry = PathBuf::from(r"C:\Strawberry\perl\bin\perl.exe");
+        if strawberry.is_file() {
+            return Some(strawberry);
+        }
+    }
+
+    let exe_name = if cfg!(windows) { "perl.exe" } else { "perl" };
+    if let Some(paths) = env::var_os("PATH") {
+        for dir in env::split_paths(&paths) {
+            let candidate = dir.join(exe_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    None
+}
+
 #[tokio::test]
 async fn journey_6_live_perl_to_rust_daemon_bridge() {
-    let perl_exe = Path::new(r"C:\Strawberry\perl\bin\perl.exe");
-    if !perl_exe.is_file() {
+    let Some(perl_exe) = resolve_perl_executable() else {
         return;
-    }
+    };
 
     let temp = TempDir::new().expect("create tempdir");
     let config = DaemonConfig::new(temp.path()).with_sweep_interval(Duration::from_secs(60));
@@ -978,10 +999,10 @@ print encode_json({
     let bridge_arg = bridge_pm.to_string_lossy().into_owned();
     let cache_arg = temp.path().to_string_lossy().into_owned();
     let output = tokio::task::spawn_blocking(move || {
-        Command::new(perl_exe)
+        Command::new(&perl_exe)
             .args(["-e", perl_script, &bridge_arg, &cache_arg])
             .output()
-            .expect("spawn Strawberry Perl")
+            .expect("spawn Perl")
     })
     .await
     .expect("join blocking Perl invocation");

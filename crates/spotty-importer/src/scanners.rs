@@ -32,7 +32,7 @@ pub const SPOTIFY_EDITORIAL_REFRESH_SECS: u64 = 86_400;
 /// # Errors
 ///
 /// Returns [`spotty_types::SpottyError`] if Spotify API requests, cache
-/// operations, or SQLite sink writes fail.
+/// operations, or `SQLite` sink writes fail.
 pub async fn scan_enabled_albums(
     api: &SpotifyClient,
     user_id: &str,
@@ -132,7 +132,7 @@ pub async fn scan_enabled_albums(
 /// # Errors
 ///
 /// Returns [`spotty_types::SpottyError`] if Spotify API requests, cache
-/// operations, or SQLite contributor upserts fail.
+/// operations, or `SQLite` contributor upserts fail.
 pub async fn scan_enabled_artists(
     api: &SpotifyClient,
     user_id: &str,
@@ -171,7 +171,7 @@ pub async fn scan_enabled_artists(
 /// # Errors
 ///
 /// Returns [`spotty_types::SpottyError`] if Spotify API requests, cache
-/// operations, or SQLite playlist upserts fail.
+/// operations, or `SQLite` playlist upserts fail.
 pub async fn scan_enabled_playlists(
     api: &SpotifyClient,
     user_id: &str,

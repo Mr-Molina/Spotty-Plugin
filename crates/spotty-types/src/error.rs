@@ -37,7 +37,7 @@ pub enum SpottyError {
     #[error("cache error: {0}")]
     Cache(String),
 
-    /// SQLite database read or write failure.
+    /// `SQLite` database read or write failure.
     #[error("database error: {0}")]
     Database(String),
 

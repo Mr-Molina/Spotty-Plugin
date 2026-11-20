@@ -13,9 +13,34 @@ import subprocess
 import sys
 from pathlib import Path
 
-AUDIT_SCRIPT = Path(
-    r"C:\Users\jmolina\.gemini\config\plugins\rust-pro\skills\rust-pro\scripts\google_rust_audit.py"
-)
+def resolve_audit_script() -> Path:
+    """Resolve google_rust_audit.py cross-platform from plugin or standalone skill dirs."""
+    home = Path.home()
+    candidates = [
+        home
+        / ".gemini"
+        / "config"
+        / "plugins"
+        / "rust-pro"
+        / "skills"
+        / "rust-pro"
+        / "scripts"
+        / "google_rust_audit.py",
+        home
+        / ".gemini"
+        / "config"
+        / "skills"
+        / "rust-pro"
+        / "scripts"
+        / "google_rust_audit.py",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return candidates[0]
+
+
+AUDIT_SCRIPT = resolve_audit_script()
 
 
 def run_step(name: str, cmd: list[str], cwd: Path) -> None:
@@ -48,9 +73,9 @@ def collect_source_mtimes(workspace: Path) -> tuple[float, Path]:
     return newest_path.stat().st_mtime, newest_path
 
 
-def release_binary_path(workspace: Path) -> Path:
+def release_binary_path(workspace: Path, binary_name: str | None = None) -> Path:
     """Return the platform-specific target/release/lms-spotty[.exe] path."""
-    name = "lms-spotty.exe" if sys.platform == "win32" else "lms-spotty"
+    name = binary_name or os_bin_subdir()[1]
     return workspace / "target" / "release" / name
 
 
@@ -66,9 +91,9 @@ def os_bin_subdir() -> tuple[str, str]:
     return "x86_64-linux-gnu-thread-multi", "lms-spotty"
 
 
-def verify_freshness(workspace: Path) -> Path:
+def verify_freshness(workspace: Path, binary_name: str | None = None) -> Path:
     """Verify release binary existence, non-empty size, mtime freshness, and --check output."""
-    binary = release_binary_path(workspace)
+    binary = release_binary_path(workspace, binary_name)
     if not binary.is_file():
         raise RuntimeError(f"Release binary missing: {binary}")
 
@@ -129,10 +154,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def stage_release_binary(workspace: Path, binary: Path) -> None:
+def stage_release_binary(
+    workspace: Path,
+    binary: Path,
+    bin_dir: str | None = None,
+    binary_name: str | None = None,
+) -> None:
     """Copy release binary into Bin/<arch>/ and verify SHA-256 byte parity."""
-    subdir, filename = os_bin_subdir()
-    dest_dir = workspace / "Bin" / subdir
+    default_subdir, default_filename = os_bin_subdir()
+    subdir = bin_dir or default_subdir
+    filename = binary_name or default_filename
+    subdir_path = Path(subdir)
+    dest_dir = subdir_path if subdir_path.is_absolute() else workspace / "Bin" / subdir_path
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / filename
 
@@ -150,6 +183,7 @@ def stage_release_binary(workspace: Path, binary: Path) -> None:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     """Parse CLI arguments."""
+    default_bin_dir, default_binary_name = os_bin_subdir()
     parser = argparse.ArgumentParser(
         description="Run Spotty-RS release verification gate and optional Bin staging."
     )
@@ -157,6 +191,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--workspace",
         default=".",
         help="Path to Spotty-RS Cargo workspace root (default: .)",
+    )
+    parser.add_argument(
+        "--bin-dir",
+        default=default_bin_dir,
+        help=f"Target LMS Bin subdirectory name (default: {default_bin_dir})",
+    )
+    parser.add_argument(
+        "--binary-name",
+        default=default_binary_name,
+        help=f"Release binary filename (default: {default_binary_name})",
     )
     parser.add_argument(
         "--stage-release",
@@ -189,9 +233,14 @@ def main(argv: list[str]) -> int:
         workspace,
     )
 
-    binary = verify_freshness(workspace)
+    binary = verify_freshness(workspace, binary_name=args.binary_name)
     if args.stage_release:
-        stage_release_binary(workspace, binary)
+        stage_release_binary(
+            workspace,
+            binary,
+            bin_dir=args.bin_dir,
+            binary_name=args.binary_name,
+        )
 
     print("Release gate PASSED.", flush=True)
     return 0
