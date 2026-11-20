@@ -11,7 +11,7 @@ use spotty_cache::DualCache;
 use spotty_types::{Result, TagCleanupPolicy};
 
 use crate::needs_update::online_library_needs_update;
-use crate::scanners::{scan_enabled_albums, scan_enabled_artists, scan_enabled_playlists};
+use crate::scanners::{scan_enabled_albums_at, scan_enabled_artists_at, scan_enabled_playlists};
 use crate::schema_sink::LibrarySink;
 
 const DEFAULT_ARTICLES: [&str; 3] = ["The", "A", "An"];
@@ -172,8 +172,6 @@ impl ImporterRunner {
             return Ok(ScanSummary::default());
         }
 
-        sink.init_online_tracks_table()?;
-
         let mut summary = ScanSummary {
             accounts_scanned: enabled.len(),
             ..ScanSummary::default()
@@ -181,13 +179,15 @@ impl ImporterRunner {
         let multi_account = enabled.len() > 1;
 
         if scope != ScanScope::PlaylistsOnly {
+            sink.init_online_tracks_table()?;
+
             for (user_id, api) in &enabled {
                 let account_tag = if multi_account {
                     Some(format!("spotify:{user_id}"))
                 } else {
                     None
                 };
-                let stored = scan_enabled_albums(
+                let stored = scan_enabled_albums_at(
                     api,
                     user_id,
                     account_tag.as_deref(),
@@ -195,6 +195,7 @@ impl ImporterRunner {
                     sink,
                     self.split_sep,
                     self.tag_cleanup,
+                    now_epoch_secs,
                 )
                 .await?;
                 summary.tracks_stored = summary.tracks_stored.saturating_add(stored);
@@ -205,8 +206,15 @@ impl ImporterRunner {
                 article_refs.push(article.as_str());
             }
             for (user_id, api) in &enabled {
-                let upserted =
-                    scan_enabled_artists(api, user_id, &self.cache, sink, &article_refs).await?;
+                let upserted = scan_enabled_artists_at(
+                    api,
+                    user_id,
+                    &self.cache,
+                    sink,
+                    &article_refs,
+                    now_epoch_secs,
+                )
+                .await?;
                 summary.artists_upserted = summary.artists_upserted.saturating_add(upserted);
             }
         }
@@ -220,7 +228,9 @@ impl ImporterRunner {
             }
         }
 
-        summary.tracks_pruned = sink.delete_removed_tracks()?;
+        if scope != ScanScope::PlaylistsOnly {
+            summary.tracks_pruned = sink.delete_removed_tracks()?;
+        }
         Ok(summary)
     }
 }
@@ -345,6 +355,19 @@ mod tests {
                 }]
             }
         });
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me/albums"))
+            .and(query_param("limit", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "total": 1,
+                "items": [{
+                    "added_at": "2026-11-18T12:00:00Z",
+                    "album": { "id": album_id }
+                }]
+            })))
+            .mount(server)
+            .await;
 
         Mock::given(method("GET"))
             .and(path("/v1/me/albums"))
@@ -603,6 +626,26 @@ mod tests {
         assert_eq!(pl_only.tracks_stored, 0);
         assert_eq!(pl_only.artists_upserted, 0);
         assert_eq!(pl_only.playlists_upserted, 1);
+
+        // CRIT-04 regression: PlaylistsOnly on an already-populated library must
+        // preserve existing Spotify album tracks instead of pruning them.
+        let pl_after_full = runner
+            .run_scan(ScanScope::PlaylistsOnly, &mut sink_no_pl, 1_700_000_010)
+            .await
+            .expect("run PlaylistsOnly after LibraryWithoutPlaylists");
+        assert_eq!(pl_after_full.tracks_pruned, 0);
+        let surviving_tracks: i64 = sink_no_pl.with_connection(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM tracks WHERE url LIKE 'spotify:track:%'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("count surviving spotify tracks")
+        });
+        assert_eq!(
+            surviving_tracks, 1,
+            "PlaylistsOnly must not delete previously imported Spotify tracks"
+        );
     }
 
     #[tokio::test]
