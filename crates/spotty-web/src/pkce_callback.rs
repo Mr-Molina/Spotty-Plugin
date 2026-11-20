@@ -483,7 +483,9 @@ mod tests {
             "code_challenge must match S256 digest of cached verifier"
         );
 
-        let expected_verifier_body = format!("code_verifier={cached_verifier}");
+        let expected_verifier_body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code_verifier", &cached_verifier)
+            .finish();
         Mock::given(method("POST"))
             .and(path("/api/token"))
             .and(body_string_contains("grant_type=authorization_code"))
@@ -561,6 +563,83 @@ mod tests {
             .expect("returns CallbackViewModel with error");
 
         assert!(vm.auth_error.is_some());
+        assert_eq!(vm.skin_override, "Default");
+    }
+
+    #[tokio::test]
+    async fn callback_exchanges_tilde_verifier_with_percent_encoding() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().expect("temp dir");
+        let cache = Arc::new(DualCache::open(dir.path().join("cache.redb")).expect("cache"));
+        let accounts = Arc::new(AccountStore::new(dir.path()));
+        let tokens = Arc::new(TokenManager::with_http(
+            format!("{}/api/token", server.uri()),
+            Client::new(),
+            Arc::clone(&cache),
+            Arc::clone(&accounts),
+            1_700_000_001,
+        ));
+
+        let tilde_verifier = format!("{}~{}", "a".repeat(63), "b".repeat(64));
+        cache
+            .put_ephemeral(
+                PKCE_VERIFIER_CACHE_KEY,
+                &Value::String(tilde_verifier.clone()),
+                Duration::from_secs(300),
+            )
+            .expect("cache put");
+
+        let expected_verifier_body = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("code_verifier", &tilde_verifier)
+            .finish();
+        assert!(
+            expected_verifier_body.contains("%7E"),
+            "form encoder must percent-encode '~' as '%7E'"
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/api/token"))
+            .and(body_string_contains(expected_verifier_body.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "tilde-tok",
+                "refresh_token": "tilde-rt",
+                "expires_in": 3600,
+                "token_type": "Bearer"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/me"))
+            .and(header("Authorization", "Bearer tilde-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "tilde-user",
+                "uri": "spotify:user:tilde-user",
+                "display_name": "Tilde User",
+                "product": "premium"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let controller = PkceCallbackController::with_endpoints(
+            format!("{}/auth/prepare", server.uri()),
+            format!("{}/auth/callback", server.uri()),
+            "https://accounts.spotify.com/authorize",
+            format!("{}/v1", server.uri()),
+            Client::new(),
+            Arc::clone(&cache),
+            Arc::clone(&accounts),
+            Arc::clone(&tokens),
+        );
+
+        let vm = controller
+            .handle_oauth_callback(&IconCode::default(), Some("tilde-code"))
+            .await
+            .expect("callback should succeed");
+        assert_eq!(vm.auth_error, None);
+        assert!(!vm.free_product);
         assert_eq!(vm.skin_override, "Default");
     }
 }
