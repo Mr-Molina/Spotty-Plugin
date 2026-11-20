@@ -1,10 +1,26 @@
 //! Spotify Web API v1 client, token manager, and pagination pipeline.
 
+pub mod browse;
+pub mod catalog;
+pub mod library;
 pub mod models;
 pub mod normalize;
 pub mod pipeline;
 pub mod token;
 pub mod transport;
+
+pub use crate::browse::{
+    round_timestamp_10m, FeaturedPlaylists, RecommendationSeeds, MAX_RECOMMENDATION_SEEDS,
+    PERSONAL_MIX_CATEGORY, RECOMMENDATION_LIMIT,
+};
+pub use crate::catalog::{
+    SearchKind, SpotifyClient, TrackCacheLookup, SPOTIFY_ALBUMS_LIMIT, SPOTIFY_LIMIT,
+};
+pub use crate::library::{
+    compute_artists_md5_hash, AlbumHydration, ArtistsLibrary, ArtistsScope, LibraryAlbumsMeta,
+    PlaylistTrackSort, PlaylistTracksOptions, SPOTIFY_PLAYLIST_MAX_ITEMS,
+    SPOTIFY_PLAYLIST_TRACKS_LIMIT,
+};
 
 pub use crate::models::{
     ArtistSummary, BrowseCategory, LinkedFrom, MinAlbum, NormalizedAlbum, NormalizedArtist,
