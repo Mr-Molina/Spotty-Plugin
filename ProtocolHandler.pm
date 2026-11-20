@@ -1,252 +1,39 @@
 package Plugins::Spotty::ProtocolHandler;
 
 use strict;
+use warnings;
 
 use base qw(Slim::Formats::RemoteStream);
-use Scalar::Util qw(blessed);
 
-use Slim::Utils::Cache;
-use Slim::Utils::Log;
-use Slim::Utils::Prefs;
-use Slim::Utils::Strings qw(cstring);
-
-use Plugins::Spotty::Plugin;
-
-my $cache = Slim::Utils::Cache->new();
-my $log = logger('plugin.spotty');
-my $prefs = preferences('plugin.spotty');
-my $serverPrefs = preferences('server');
-
-use constant IMG_TRACK => '/html/images/cover.png';
-
-# https://open.spotify.com/album/4qpB1EXFCmq0a209JGCsZt
-# https://open.spotify.com/intl-de/album/3xN9KNcFz7zgjfNu6mQD6M?si=pYVY9S1WTSmVT0qLT5WY7Q
-use constant PAGE_URL_REGEXP => qr{open.spotify.com/(.+)/([a-z0-9]+)};
-Slim::Player::ProtocolHandlers->registerURLHandler(PAGE_URL_REGEXP, __PACKAGE__) if Slim::Player::ProtocolHandlers->can('registerURLHandler');
+use Plugins::Spotty::SpottyBridge;
 
 sub contentType { 'spt' }
+sub canSeek { 1 }
+sub canTranscodeSeek { 1 }
 
-# transcoding needs a fix only available in 7.9.1
-sub canSeek { Slim::Utils::Versions->compareVersions($::VERSION, '7.9.1') >= 0 }
-sub canTranscodeSeek { Slim::Utils::Versions->compareVersions($::VERSION, '7.9.1') >= 0 }
+sub getMetadataFor {
+	my ($class, $client, $url) = @_;
+	return Plugins::Spotty::SpottyBridge->call('protocol.metadata', {
+		client => ($client ? $client->id : undef),
+		url    => $url,
+	});
+}
 
-sub getSeekData {
-	my ($class, $client, $song, $newtime) = @_;
-	return { timeOffset => $newtime };
+sub explodePlaylist {
+	my ($class, $client, $url, $cb) = @_;
+	my $res = Plugins::Spotty::SpottyBridge->call('protocol.explode_playlist', {
+		client => ($client ? $client->id : undef),
+		url    => $url,
+	});
+	return $cb ? $cb->($res) : $res;
 }
 
 sub trackGain {
 	my ($class, $client, $url) = @_;
-
-	return unless $client && blessed $client;
-
-	# if spotty's replaygain is enabled, then don't additionally change in LMS
-	return if $prefs->client($client)->get('replaygain');
-
-	# otherwise respect LMS' settings
-	my $cprefs = $serverPrefs->client($client);
-	return $cprefs->get('replayGainMode') && $cprefs->get('remoteReplayGain');
-}
-
-sub formatOverride {
-	my ($class, $song) = @_;
-
-	# Update the transcoding table with the current player's Spotty ID...
-	Plugins::Spotty::Plugin->updateTranscodingTable($song->master);
-
-	# check if we want/need to purge the audio cache
-	# this needs to be done from whatever code being run once per track
-	Plugins::Spotty::AccountHelper->purgeAudioCacheAfterXTracks();
-
-	return 'spt';
-}
-
-sub canDirectStream { 0 }
-
-# P = Chosen by the user
-sub audioScrobblerSource { 'P' }
-
-sub explodePlaylist {
-	my ( $class, $client, $uri, $cb ) = @_;
-
-	if ($uri =~ PAGE_URL_REGEXP) {
-		my $uriInfo = Plugins::Spotty::OPML::parseUri($uri);
-		if ($uriInfo && ref $uriInfo && $uriInfo->{uri}) {
-			$uri = $uriInfo->{uri};
-		}
-	}
-
-	main::INFOLOG && $log->is_info && $log->info("Explode URI: $uri");
-	if (my $spotty = Plugins::Spotty::Plugin->getAPIHandler($client)) {
-		$spotty->tracksFromURI(sub {
-			my $result = shift || [];
-			my $firstItem = $result->[0];
-
-			# OPML - return everything
-			if (ref $firstItem) {
-				$cb->({ items => Plugins::Spotty::OPML::trackList($client, $result) });
-			}
-			else {
-				$cb->([
-					map {
-						/((?:track|episode):.*)/;
-						"spotify://$1";
-					} @{$result}
-				]);
-			}
-		}, $uri);
-	}
-	else {
-		$cb->([]);
-	}
-}
-
-sub getMetadataFor {
-	my ( $class, $client, $url, undef, $song ) = @_;
-
-	my $meta = {
-		artist    => '',
-		album     => '',
-		title     => '',
-		duration  => 0,
-		cover     => IMG_TRACK,
-		icon      => IMG_TRACK,
-		bitrate   => $prefs->get('bitrate') . cstring($client, 'KBPS'),
-		type      => 'ogg',
-	};
-
-	if ( !Plugins::Spotty::AccountHelper->hasCredentials() ) {
-		$meta->{artist} = cstring($client, 'PLUGIN_SPOTTY_NOT_AUTHORIZED_HINT');
-		$meta->{title} = cstring($client, 'PLUGIN_SPOTTY_NOT_AUTHORIZED_HINT');
-		return $meta;
-	}
-	elsif ( !Slim::Networking::Async::HTTP->hasSSL() ) {
-		$meta->{artist} = cstring($client, 'PLUGIN_SPOTTY_MISSING_SSL');
-		$meta->{title} = cstring($client, 'PLUGIN_SPOTTY_MISSING_SSL');
-		return $meta;
-	}
-
-	$meta = undef;
-
-	if ( $client && ($song ||= $client->currentSongForUrl($url)) ) {
-		# we store a copy of the metadata in the song object - no need to read from the disk cache
-		my $info = $song->pluginData('info');
-		if ( $info->{title} && $info->{duration} && ($info->{url} eq $url) ) {
-			$info->{samplesize} = $song->samplesize || 16;
-			$info->{samplerate} = $song->samplerate || 44100;
-
-			$song->duration($info->{duration});
-
-			main::INFOLOG && $log->is_info && $log->info("Returning metadata cached in song object for $url");
-			main::DEBUGLOG && $log->is_debug && $log->debug(Data::Dump::dump($info));
-			return $info;
-		}
-	}
-
-	my $uri = $url;
-	$uri =~ s/\///g;
-
-	my $spotty = Plugins::Spotty::Plugin->getAPIHandler($client);
-
-	if ( my $cached = Plugins::Spotty::API->trackCached(undef, $uri, { noLookup => 1 }) ) {
-		$meta = {
-			artist    => join( ', ', map { $_->{name} } @{ $cached->{artists} } ),
-			album     => $cached->{album}->{name},
-			title     => $cached->{name},
-			duration  => $cached->{duration_ms} / 1000,
-			cover     => $cached->{image} || $cached->{album}->{image},
-			year      => $cached->{album}->{release_date} ? substr($cached->{album}->{release_date}, 0, 4) : '',
-		};
-
-		main::INFOLOG && $log->is_info && $log->info("Found cached metadata for $uri");
-		main::DEBUGLOG && $log->is_debug && $log->debug(Data::Dump::dump($meta));
-	}
-
-	if (!$meta) {
-		# grab missing metadata asynchronously
-		main::INFOLOG && $log->is_info && $log->info("No metadata found - need to look online: $uri");
-		$class->getBulkMetadata($client, $song ? undef : $url);
-		$meta = {};
-	}
-
-	$meta ||= {};
-	$meta->{bitrate} ||= $prefs->get('bitrate') . cstring($client, 'KBPS');
-	$meta->{type}    ||= 'ogg';
-	$meta->{cover}   ||= IMG_TRACK;
-	$meta->{icon}    ||= IMG_TRACK;
-
-	if ($prefs->get('cleanupTags')) {
-		$meta->{title} = Plugins::Spotty::API::Cache->cleanupTags($meta->{title});
-		$meta->{album} = Plugins::Spotty::API::Cache->cleanupTags($meta->{album});
-	}
-
-	if ($song) {
-		if ( $meta->{duration} && !($song->duration && $song->duration > 0) ) {
-			$song->duration($meta->{duration});
-		}
-		$meta->{url} = $url;
-		$meta->{samplesize} = $song->samplesize || 16;
-		$meta->{samplerate} = $song->samplerate || 44100;
-
-		$song->pluginData( info => $meta );
-	}
-
-	return $meta;
-}
-
-my $fetchingMeta;
-sub getBulkMetadata {
-	my ($class, $client, $uri) = @_;
-
-	return if $fetchingMeta;
-
-	my @uris;
-
-	if ($uri) {
-		@uris = ($uri);
-	}
-	else {
-		@uris = @{ Slim::Player::Playlist::playList($client) };
-	}
-
-	if (scalar @uris) {
-		# Go fetch metadata for all tracks on the playlist without metadata
-		my @need;
-
-		my $spotty = Plugins::Spotty::Plugin->getAPIHandler($client) || return;
-
-		for my $track ( @uris ) {
-			my $uri = blessed($track) ? $track->url : $track;
-			$uri =~ s/\///g;
-
-			next unless $uri =~ /^spotify:(?:episode|track)/;
-
-			if ( !$spotty->trackCached(undef, $uri, { noLookup => 1 }) ) {
-				push @need, $uri;
-			}
-		}
-
-		if (scalar @need && !$fetchingMeta) {
-			$fetchingMeta = 1;
-
-			if ( main::INFOLOG && $log->is_info ) {
-				$log->info( "Need to fetch metadata for: " . Data::Dump::dump(@need) );
-			}
-
-			$spotty->tracks(sub {
-				# Update the playlist time so the web will refresh, etc
-				$client->currentPlaylistUpdateTime( Time::HiRes::time() );
-
-				Slim::Control::Request::notifyFromArray( $client, [ 'newmetadata' ] );
-
-				$fetchingMeta = 0;
-			}, \@need);
-		}
-	}
-}
-
-sub getIcon {
-	return Plugins::Spotty::Plugin->_pluginDataFor('icon');
+	return Plugins::Spotty::SpottyBridge->call('protocol.track_gain', {
+		client => ($client ? $client->id : undef),
+		url    => $url,
+	});
 }
 
 1;

@@ -4,3 +4,5 @@ Spotty/**/spotty-custom*
 Spotty/**/findSpotifyFolderFiles.*
 Spotty/**/test.sh
 Spotty/cloud*
+Spotty/target/**
+Spotty/crates/**
