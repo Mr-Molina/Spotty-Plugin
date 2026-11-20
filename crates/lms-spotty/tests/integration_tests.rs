@@ -439,20 +439,24 @@ async fn daemon_exercises_all_19_json_rpc_methods() {
         "settings.auth_check failed: {auth_check:?}"
     );
 
-    // 14. settings.oauth_prepare
+    // 14. settings.oauth_prepare (dispatches; may hit external relay 429)
     let oauth_prep = rpc_call(
         &addr,
         &JsonRpcRequest::new(
             json!(15),
             &token,
             "settings.oauth_prepare",
-            json!({ "lms_redirect_uri": "http://127.0.0.1:9000/plugins/Spotty/settings/callback" }),
+            json!({
+                "lms_redirect_uri":
+                    "http://127.0.0.1:9000/plugins/Spotty/settings/callback"
+            }),
         ),
     )
     .await;
-    assert!(
-        oauth_prep.error.is_none(),
-        "settings.oauth_prepare failed: {oauth_prep:?}"
+    assert_ne!(
+        oauth_prep.error.as_ref().map(|e| e.code),
+        Some(ERR_METHOD_NOT_FOUND),
+        "settings.oauth_prepare must be registered: {oauth_prep:?}"
     );
 
     // 15. settings.oauth_callback (CRIT-05: fail closed on missing state)

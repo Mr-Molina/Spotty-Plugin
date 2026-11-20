@@ -10,6 +10,7 @@ Spotty/crates/**
 Spotty/Cargo.toml
 Spotty/Cargo.lock
 Spotty/rustfmt.toml
+Spotty/clippy.toml
 Spotty/scripts/**
 Spotty/.agents/**
 Spotty/docs/**

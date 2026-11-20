@@ -1394,4 +1394,120 @@ mod tests {
             assert_eq!(stub_url, "spotify:track:rel_stub");
         });
     }
+
+    #[test]
+    fn lyrion_9_1_1_exact_ddl_roundtrip() {
+        let conn = Connection::open_in_memory().expect("in-memory sqlite");
+        conn.execute_batch(
+            "CREATE TABLE albums (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title blob, titlesort text, titlesearch text,
+                    customsearch text, compilation bool, year smallint(5),
+                    artwork char(8), disc tinyint(1), discc tinyint(1),
+                    replay_gain float, replay_peak float,
+                    musicbrainz_id varchar(40), musicmagic_mixable bool,
+                    contributor int(10), extid varchar(64),
+                    release_type varchar(64), subtitle blob, label blob
+                 );
+                 CREATE TABLE tracks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    url text NOT NULL COLLATE NOCASE,
+                    title blob, titlesort text, titlesearch text,
+                    customsearch text, album int(10), tracknum int(10),
+                    content_type varchar(255), timestamp int(10),
+                    filesize int(10), audio_size int(10),
+                    audio_offset int(10), year smallint(5), secs float,
+                    cover blob, vbr_scale varchar(255), bitrate float,
+                    samplerate int(10), samplesize int(10),
+                    channels tinyint(1), block_alignment int(10),
+                    endian bool, bpm smallint(5),
+                    tagversion varchar(255), drm bool, disc tinyint(1),
+                    audio bool, remote bool, lossless bool,
+                    lyrics text COLLATE NOCASE, musicbrainz_id varchar(40),
+                    musicmagic_mixable bool, replay_gain float,
+                    replay_peak float, extid varchar(64),
+                    primary_artist int(10),
+                    urlmd5 char(32) NOT NULL default '0',
+                    coverid char(8) default NULL,
+                    cover_cached char(1) default NULL,
+                    virtual char(1) default NULL,
+                    added_time int(10) default NULL,
+                    updated_time int(10) default NULL,
+                    dlna_profile varchar(32), hash char(8), work integer,
+                    subtitle blob, grouping blob, performance blob,
+                    discsubtitle blob,
+                    FOREIGN KEY (album) REFERENCES albums (id)
+                        ON DELETE CASCADE
+                 );
+                 CREATE TABLE contributors (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name blob, namesort text, namesearch text,
+                    customsearch text, musicbrainz_id varchar(40),
+                    musicmagic_mixable bool, extid varchar(512),
+                    portrait blob default NULL,
+                    portraitid char(8) default NULL
+                 );
+                 CREATE TABLE contributor_track (
+                    role int(10), contributor int(10), track int(10),
+                    PRIMARY KEY (role, contributor, track),
+                    FOREIGN KEY (track) REFERENCES tracks (id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (contributor) REFERENCES contributors (id)
+                        ON DELETE CASCADE
+                 );
+                 CREATE TABLE genres (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name blob, namesort text, namesearch text,
+                    customsearch text, musicmagic_mixable bool
+                 );
+                 CREATE TABLE genre_track (
+                    genre int(10), track int(10),
+                    PRIMARY KEY (genre, track),
+                    FOREIGN KEY (track) REFERENCES tracks (id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (genre) REFERENCES genres (id)
+                        ON DELETE CASCADE
+                 );
+                 CREATE TABLE playlist_track (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position int(10), playlist int(10),
+                    track text NOT NULL,
+                    FOREIGN KEY (playlist) REFERENCES tracks (id)
+                        ON DELETE CASCADE
+                 );",
+        )
+        .expect("create exact Lyrion 9.1.1 DDL");
+
+        let mut sink = SqliteLibrarySink::new(conn).expect("wrap Lyrion 9.1.1 schema");
+        sink.init_online_tracks_table().expect("init online_tracks");
+        sink.store_tracks(&[make_row("lyrion1", "Lyrion Track")])
+            .expect("store_tracks on Lyrion DDL");
+        sink.upsert_playlist(
+            "spotify:playlist:lyrion_pl1",
+            "Lyrion Playlist",
+            "",
+            &[String::from("spotify:track:lyrion1")],
+        )
+        .expect("upsert_playlist on Lyrion DDL");
+
+        sink.with_connection(|conn| {
+            let urlmd5: String = conn
+                .query_row(
+                    "SELECT urlmd5 FROM tracks WHERE url = ?1",
+                    params!["spotify:track:lyrion1"],
+                    |r| r.get(0),
+                )
+                .expect("query urlmd5");
+            assert_eq!(urlmd5, "0");
+
+            let pt_track: String = conn
+                .query_row(
+                    "SELECT track FROM playlist_track WHERE position = 0",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("query playlist_track.track");
+            assert_eq!(pt_track, "spotify:track:lyrion1");
+        });
+    }
 }
